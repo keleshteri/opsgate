@@ -59,7 +59,14 @@ else
 fi
 
 # ── Make entry point executable ───────────────────────────────────────────────
-chmod +x "$INSTALL_DIR/src/index.js"
+# Build TypeScript if dist/ is missing or outdated
+if [ ! -f "$INSTALL_DIR/dist/index.js" ]; then
+  echo -e "\n${CYAN}→  Building TypeScript...${NC}"
+  npm run build
+  echo -e "${GREEN}✓  Build complete${NC}"
+fi
+
+chmod +x "$INSTALL_DIR/dist/index.js"
 
 # ── Try npm link first (cleanest) ─────────────────────────────────────────────
 echo -e "\n${CYAN}→  Linking opsgate command...${NC}"
