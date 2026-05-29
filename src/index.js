@@ -2,9 +2,9 @@
 import inquirer from 'inquirer';
 import { nanoid } from 'nanoid';
 import Fuse from 'fuse.js';
-import { c, banner, msg, divider, profileSummary, groupColor } from './lib/ui.js';
+import { c, banner, msg, profileSummary, groupColor } from './lib/ui.js';
 import { getProfiles, saveProfile, deleteProfile, getGroups, touchProfile, storePath } from './lib/store.js';
-import { connect, copySSHKey, buildSSHCommand, testConnection } from './lib/ssh.js';
+import { connect, copySSHKey, buildSSHCommand, testConnection, getConnectMethods } from './lib/ssh.js';
 
 // ─── Main loop ───────────────────────────────────────────────────────────────
 
@@ -31,16 +31,31 @@ async function main() {
       pageSize: 10,
     }]);
 
-    if (action === 'exit') {
-      console.log(c.muted('\nBye!\n'));
-      process.exit(0);
-    }
+    if (action === 'exit') { console.log(c.muted('\nBye!\n')); process.exit(0); }
     if (action === 'connect')  await menuConnect();
     if (action === 'manage')   await menuManage();
     if (action === 'groups')   await menuGroups();
     if (action === 'search')   await menuSearch();
     if (action === 'copykey')  await menuCopyKey();
   }
+}
+
+// ─── Connect method picker ────────────────────────────────────────────────────
+// If the profile only has one method (public IP) → connect directly.
+// If it has 2+ options → show picker first.
+
+async function pickConnectMethod(profile) {
+  const methods = getConnectMethods(profile);
+  if (methods.length === 1) return methods[0].value;
+
+  const { method } = await inquirer.prompt([{
+    type: 'list',
+    name: 'method',
+    message: c.primary('How do you want to connect?'),
+    choices: methods.map(m => ({ name: m.name, value: m.value })),
+  }]);
+
+  return method;
 }
 
 // ─── Connect ─────────────────────────────────────────────────────────────────
@@ -71,25 +86,14 @@ async function menuConnect(prefilter = null) {
   if (id === '__back__') return;
 
   const profile = profiles.find(p => p.id === id);
+  const method  = await pickConnectMethod(profile);
+
   banner();
   console.log(c.primary.bold(`  Connecting to: `) + c.secondary(profile.name));
-  console.log(c.muted(`  Command: `) + c.text(buildSSHCommand(profile)));
+  console.log(c.muted(`  Method:  `) + c.warning(method));
+  console.log(c.muted(`  Command: `) + c.text(buildSSHCommand(profile, method)));
 
-  if (profile.tunnels?.length) {
-    console.log(c.warning(`  Tunnels:`));
-    profile.tunnels.forEach(t => {
-      if (t.type === 'local')   console.log(c.muted(`    L  localhost:${t.localPort} → ${t.remoteHost}:${t.remotePort}`));
-      if (t.type === 'remote')  console.log(c.muted(`    R  remote:${t.localPort} → ${t.remoteHost}:${t.remotePort}`));
-      if (t.type === 'dynamic') console.log(c.muted(`    D  SOCKS proxy on localhost:${t.localPort}`));
-    });
-  }
-  if (profile.jumpHost) {
-    console.log(c.warning(`  Jump host: `) + c.muted(profile.jumpHost));
-  }
-  if (profile.notes) {
-    console.log(c.muted(`  Notes: `) + c.text(profile.notes));
-  }
-  console.log();
+  printProfileDetail(profile);
 
   const { confirm } = await inquirer.prompt([{
     type: 'confirm',
@@ -101,7 +105,7 @@ async function menuConnect(prefilter = null) {
   if (confirm) {
     touchProfile(profile.id);
     console.log(c.success('\n  Launching SSH...\n'));
-    connect(profile);
+    connect(profile, method);
   }
 }
 
@@ -134,33 +138,28 @@ async function menuManage() {
     if (action === '__back__') return;
     if (action === '__add__')  { await formAddProfile(); continue; }
     if (action.startsWith('view:')) {
-      const id = action.slice(5);
-      const done = await menuProfileActions(id);
-      if (done) continue;
+      await menuProfileActions(action.slice(5));
     }
   }
 }
 
 async function menuProfileActions(id) {
   const profile = getProfiles().find(p => p.id === id);
-  if (!profile) return true;
+  if (!profile) return;
 
   banner();
   console.log(c.primary.bold(`  Profile: `) + c.secondary(profile.name));
   console.log(c.muted(`  Host:    `) + c.text(`${profile.user}@${profile.host}:${profile.port}`));
-  if (profile.keyPath)  console.log(c.muted(`  Key:     `) + c.text(profile.keyPath));
-  if (profile.jumpHost) console.log(c.muted(`  Jump:    `) + c.text(profile.jumpHost));
-  if (profile.notes)    console.log(c.muted(`  Notes:   `) + c.text(profile.notes));
-  if (profile.tunnels?.length) {
-    console.log(c.muted(`  Tunnels:`));
-    profile.tunnels.forEach(t => {
-      if (t.type === 'local')   console.log(c.muted(`    L  localhost:${t.localPort} → ${t.remoteHost}:${t.remotePort}`));
-      if (t.type === 'remote')  console.log(c.muted(`    R  remote:${t.localPort} → ${t.remoteHost}:${t.remotePort}`));
-      if (t.type === 'dynamic') console.log(c.muted(`    D  SOCKS localhost:${t.localPort}`));
-    });
-  }
-  console.log(c.muted(`  Command: `) + c.text(buildSSHCommand(profile)));
+  if (profile.hostPrivate)         console.log(c.muted(`  Private: `) + c.text(profile.hostPrivate));
+  if (profile.keyPath)             console.log(c.muted(`  Key:     `) + c.text(profile.keyPath));
+  if (profile.jumpHost)            console.log(c.muted(`  Jump:    `) + c.text(profile.jumpHost));
+  if (profile.cloudflaredHostname) console.log(c.muted(`  CF Tunnel: `) + c.primary(profile.cloudflaredHostname));
+  if (profile.proxyCommand)        console.log(c.muted(`  Proxy:   `) + c.text(profile.proxyCommand));
+  if (profile.notes)               console.log(c.muted(`  Notes:   `) + c.text(profile.notes));
+  printProfileDetail(profile);
   console.log();
+
+  const methods = getConnectMethods(profile);
 
   const { action } = await inquirer.prompt([{
     type: 'list',
@@ -177,19 +176,26 @@ async function menuProfileActions(id) {
     ],
   }]);
 
-  if (action === 'back')    return true;
-  if (action === 'connect') { touchProfile(id); connect(profile); return true; }
-  if (action === 'edit')    { await formEditProfile(profile); return true; }
-  if (action === 'copykey') { await menuCopyKey(profile); return true; }
-  if (action === 'delete')  { await confirmDelete(id); return true; }
+  if (action === 'back')    return;
+  if (action === 'edit')    { await formEditProfile(profile); return; }
+  if (action === 'delete')  { await confirmDelete(id); return; }
+  if (action === 'copykey') { await menuCopyKey(profile); return; }
+
+  if (action === 'connect') {
+    const method = await pickConnectMethod(profile);
+    touchProfile(id);
+    console.log(c.success('\n  Launching SSH...\n'));
+    connect(profile, method);
+    return;
+  }
+
   if (action === 'test') {
-    console.log(c.muted('\n  Testing connection (timeout 5s)...'));
-    const ok = testConnection(profile);
+    const method = await pickConnectMethod(profile);
+    console.log(c.muted(`\n  Testing ${method} connection (timeout 5s)...`));
+    const ok = testConnection(profile, method);
     msg(ok ? 'Connection successful!' : 'Connection failed.', ok ? 'success' : 'error');
     await pause();
-    return true;
   }
-  return true;
 }
 
 async function confirmDelete(id) {
@@ -200,7 +206,7 @@ async function confirmDelete(id) {
     message: c.error(`Delete profile "${profile?.name}"? This cannot be undone.`),
     default: false,
   }]);
-  if (yes) { deleteProfile(id); msg(`Profile deleted.`, 'success'); await pause(); }
+  if (yes) { deleteProfile(id); msg('Profile deleted.', 'success'); await pause(); }
 }
 
 // ─── Add / Edit forms ────────────────────────────────────────────────────────
@@ -241,17 +247,12 @@ async function formEditProfile(profile) {
 
 async function askProfileFields(defaults = {}) {
   return inquirer.prompt([
+    // ── Basic ──────────────────────────────────────────────────────────────
     {
       type: 'input', name: 'name',
       message: 'Profile name (alias):',
       default: defaults.name,
       validate: v => v.trim() ? true : 'Name is required',
-    },
-    {
-      type: 'input', name: 'host',
-      message: 'Hostname or IP:',
-      default: defaults.host,
-      validate: v => v.trim() ? true : 'Host is required',
     },
     {
       type: 'input', name: 'user',
@@ -269,11 +270,38 @@ async function askProfileFields(defaults = {}) {
       message: 'Path to SSH private key (leave blank to skip):',
       default: defaults.keyPath ?? '',
     },
+
+    // ── IPs ────────────────────────────────────────────────────────────────
+    {
+      type: 'input', name: 'host',
+      message: `Public IP or hostname ${c.muted('(required)')}:`,
+      default: defaults.host,
+      validate: v => v.trim() ? true : 'Public host is required',
+    },
+    {
+      type: 'input', name: 'hostPrivate',
+      message: `Private / internal IP ${c.muted('(optional — e.g. GCP internal IP)')}:`,
+      default: defaults.hostPrivate ?? '',
+    },
+
+    // ── Connectivity options ───────────────────────────────────────────────
     {
       type: 'input', name: 'jumpHost',
-      message: 'Jump host / bastion (user@host:port, leave blank to skip):',
+      message: `Jump host / bastion ${c.muted('(user@host:port — optional)')}:`,
       default: defaults.jumpHost ?? '',
     },
+    {
+      type: 'input', name: 'cloudflaredHostname',
+      message: `Cloudflare Tunnel hostname ${c.muted('(e.g. ssh.example.com — optional)')}:`,
+      default: defaults.cloudflaredHostname ?? '',
+    },
+    {
+      type: 'input', name: 'proxyCommand',
+      message: `ProxyCommand ${c.muted('(custom proxy, e.g. nc %h %p — optional)')}:`,
+      default: defaults.proxyCommand ?? '',
+    },
+
+    // ── Metadata ───────────────────────────────────────────────────────────
     {
       type: 'list', name: 'group',
       message: 'Environment group:',
@@ -282,7 +310,7 @@ async function askProfileFields(defaults = {}) {
     },
     {
       type: 'input', name: 'tags',
-      message: 'Tags (comma-separated, e.g. k8s,web):',
+      message: `Tags ${c.muted('(comma-separated, e.g. k8s,web)')}:`,
       default: (defaults.tags ?? []).join(','),
       filter: v => v.split(',').map(t => t.trim()).filter(Boolean),
     },
@@ -298,6 +326,8 @@ async function askProfileFields(defaults = {}) {
     },
   ]);
 }
+
+// ─── Tunnel wizard ────────────────────────────────────────────────────────────
 
 async function askTunnels(existing = []) {
   const tunnels = [...existing];
@@ -318,12 +348,12 @@ async function askTunnels(existing = []) {
       type: 'list', name: 'action',
       message: 'Tunnels',
       choices: [
-        { name: '+ Add local port forward (L)',      value: 'local' },
-        { name: '+ Add remote port forward (R)',     value: 'remote' },
-        { name: '+ Add dynamic SOCKS proxy (D)',     value: 'dynamic' },
+        { name: '+ Add local port forward (L)  — e.g. forward remote DB to localhost',  value: 'local' },
+        { name: '+ Add remote port forward (R) — e.g. expose local port on server',      value: 'remote' },
+        { name: '+ Add dynamic SOCKS proxy (D) — route traffic through server',          value: 'dynamic' },
         ...(tunnels.length > 0 ? [{ name: c.error('✗ Remove a tunnel'), value: 'remove' }] : []),
         new inquirer.Separator(),
-        { name: c.success('✓ Done'),                 value: 'done' },
+        { name: c.success('✓ Done'), value: 'done' },
       ],
     }]);
 
@@ -351,9 +381,9 @@ async function askTunnels(existing = []) {
       tunnels.push({ type: 'dynamic', localPort });
     } else {
       const t = await inquirer.prompt([
-        { type: 'number', name: 'localPort',   message: 'Local port:',   default: 8080 },
-        { type: 'input',  name: 'remoteHost',  message: 'Remote host:',  default: 'localhost' },
-        { type: 'number', name: 'remotePort',  message: 'Remote port:',  default: 80 },
+        { type: 'number', name: 'localPort',  message: 'Local port:',   default: 8080 },
+        { type: 'input',  name: 'remoteHost', message: 'Remote host:',  default: 'localhost' },
+        { type: 'number', name: 'remotePort', message: 'Remote port:',  default: 80 },
       ]);
       tunnels.push({ type: action, ...t });
     }
@@ -381,7 +411,7 @@ async function menuGroups() {
     choices: [
       ...groups.map(g => {
         const count = getProfiles().filter(p => p.group === g).length;
-        return { name: `${groupColor(g).padEnd(12)}  ${c.muted(`(${count} server${count !== 1 ? 's' : ''})`)}`, value: g };
+        return { name: `${groupColor(g)}  ${c.muted(`(${count} server${count !== 1 ? 's' : ''})`)}`, value: g };
       }),
       new inquirer.Separator(),
       { name: c.muted('← Back'), value: '__back__' },
@@ -405,13 +435,13 @@ async function menuSearch() {
   const { query } = await inquirer.prompt([{
     type: 'input',
     name: 'query',
-    message: c.primary('Search profiles (name, host, user, tags, group):'),
+    message: c.primary('Search (name, host, private IP, user, tags, group):'),
   }]);
 
   if (!query.trim()) return;
 
   const fuse = new Fuse(profiles, {
-    keys: ['name', 'host', 'user', 'group', 'tags', 'notes'],
+    keys: ['name', 'host', 'hostPrivate', 'user', 'group', 'tags', 'notes', 'cloudflaredHostname'],
     threshold: 0.4,
   });
 
@@ -469,6 +499,18 @@ async function menuCopyKey(preselect = null) {
     profile = profiles.find(p => p.id === id);
   }
 
+  // Pick IP if private is available
+  const methods = getConnectMethods(profile).filter(m => m.value === 'public' || m.value === 'private');
+  let method = 'public';
+  if (methods.length > 1) {
+    const { m } = await inquirer.prompt([{
+      type: 'list', name: 'm',
+      message: 'Copy key via which IP?',
+      choices: methods.map(m => ({ name: m.name, value: m.value })),
+    }]);
+    method = m;
+  }
+
   const { keyPath } = await inquirer.prompt([{
     type: 'input',
     name: 'keyPath',
@@ -476,16 +518,18 @@ async function menuCopyKey(preselect = null) {
     default: '~/.ssh/id_rsa.pub',
   }]);
 
+  const targetHost = method === 'private' ? profile.hostPrivate : profile.host;
+
   const { confirm } = await inquirer.prompt([{
     type: 'confirm',
     name: 'confirm',
-    message: `Copy ${c.warning(keyPath)} to ${c.secondary(`${profile.user}@${profile.host}`)}?`,
+    message: `Copy ${c.warning(keyPath)} to ${c.secondary(`${profile.user}@${targetHost}`)}?`,
     default: true,
   }]);
 
   if (confirm) {
     console.log(c.muted('\n  Running ssh-copy-id...\n'));
-    const result = copySSHKey(profile, keyPath);
+    const result = copySSHKey(profile, keyPath, method);
     if (result.success) {
       msg('SSH key copied successfully!', 'success');
     } else {
@@ -496,6 +540,23 @@ async function menuCopyKey(preselect = null) {
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+function printProfileDetail(profile) {
+  if (profile.tunnels?.length) {
+    console.log(c.warning(`  Tunnels:`));
+    profile.tunnels.forEach(t => {
+      if (t.type === 'local')   console.log(c.muted(`    L  localhost:${t.localPort} → ${t.remoteHost}:${t.remotePort}`));
+      if (t.type === 'remote')  console.log(c.muted(`    R  remote:${t.localPort} → ${t.remoteHost}:${t.remotePort}`));
+      if (t.type === 'dynamic') console.log(c.muted(`    D  SOCKS proxy on localhost:${t.localPort}`));
+    });
+  }
+  if (profile.jumpHost) {
+    console.log(c.warning(`  Jump host: `) + c.muted(profile.jumpHost));
+  }
+  if (profile.notes) {
+    console.log(c.muted(`  Notes: `) + c.text(profile.notes));
+  }
+}
 
 function pause() {
   return inquirer.prompt([{ type: 'input', name: '_', message: c.muted('Press Enter to continue...') }]);
