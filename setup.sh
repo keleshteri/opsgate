@@ -29,11 +29,34 @@ fi
 
 echo -e "${GREEN}✓  Node.js $(node -v) found${NC}"
 
-# ── Install dependencies ──────────────────────────────────────────────────────
-echo -e "\n${CYAN}→  Installing dependencies...${NC}"
+# ── Install dependencies (npm ci = exact lockfile, no drift) ─────────────────
+echo -e "\n${CYAN}→  Installing dependencies (locked versions)...${NC}"
 cd "$INSTALL_DIR"
-npm install --production --silent
+
+# Use npm ci if package-lock.json exists — guarantees exact versions from lockfile.
+# Falls back to npm install only if lockfile is missing (first-time clone).
+if [ -f "package-lock.json" ]; then
+  npm ci --omit=dev --silent
+else
+  echo -e "${YELLOW}  Warning: package-lock.json not found. Using npm install (less safe).${NC}"
+  npm install --omit=dev --silent
+fi
+
 echo -e "${GREEN}✓  Dependencies installed${NC}"
+
+# ── Security audit ────────────────────────────────────────────────────────────
+echo -e "\n${CYAN}→  Running security audit...${NC}"
+if npm audit --audit-level=moderate 2>&1 | grep -q "found 0 vulnerabilities"; then
+  echo -e "${GREEN}✓  No vulnerabilities found${NC}"
+else
+  npm audit --audit-level=moderate || true
+  echo -e "${YELLOW}  Warning: vulnerabilities found above. Run: npm audit fix${NC}"
+  read -r -p "  Continue anyway? [y/N] " CONT
+  if [[ ! "$CONT" =~ ^[Yy]$ ]]; then
+    echo -e "${RED}  Aborted.${NC}"
+    exit 1
+  fi
+fi
 
 # ── Make entry point executable ───────────────────────────────────────────────
 chmod +x "$INSTALL_DIR/src/index.js"

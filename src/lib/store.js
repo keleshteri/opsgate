@@ -1,9 +1,19 @@
 import Conf from 'conf';
+import { chmodSync, existsSync } from 'fs';
 
 const store = new Conf({
   projectName: 'opsgate',
   defaults: { profiles: [] },
 });
+
+// Lock config file to owner-only (600) on every startup
+try {
+  if (existsSync(store.path)) {
+    chmodSync(store.path, 0o600);
+  }
+} catch {
+  // Non-fatal: Windows or permission edge case
+}
 
 export function getProfiles() {
   return store.get('profiles');
@@ -22,6 +32,9 @@ export function saveProfile(profile) {
     profiles.push(profile);
   }
   store.set('profiles', profiles);
+
+  // Re-lock permissions after every write
+  try { chmodSync(store.path, 0o600); } catch { /* non-fatal */ }
 }
 
 export function deleteProfile(id) {
