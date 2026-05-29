@@ -6,3 +6,6 @@ dist/
 npm-debug.log*
 .DS_Store
 Thumbs.db
+
+# Old JS sources (replaced by TypeScript)
+src/**/*.js

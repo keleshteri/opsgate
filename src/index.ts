@@ -5,17 +5,18 @@ import Fuse from 'fuse.js';
 import { c, banner, msg, profileSummary, groupColor } from './lib/ui.js';
 import { getProfiles, saveProfile, deleteProfile, getGroups, touchProfile, storePath } from './lib/store.js';
 import { connect, copySSHKey, buildSSHCommand, testConnection, getConnectMethods } from './lib/ssh.js';
+import type { Profile, Tunnel, ConnectMethod } from './lib/types.js';
 
 // ─── Main loop ───────────────────────────────────────────────────────────────
 
-async function main() {
+async function main(): Promise<void> {
   while (true) {
     banner();
 
     const profiles = getProfiles();
     console.log(c.muted(`  Profiles: ${profiles.length}  •  Config: ${storePath}\n`));
 
-    const { action } = await inquirer.prompt([{
+    const { action } = await inquirer.prompt<{ action: string }>([{
       type: 'list',
       name: 'action',
       message: c.primary.bold('Main Menu'),
@@ -41,14 +42,12 @@ async function main() {
 }
 
 // ─── Connect method picker ────────────────────────────────────────────────────
-// If the profile only has one method (public IP) → connect directly.
-// If it has 2+ options → show picker first.
 
-async function pickConnectMethod(profile) {
+async function pickConnectMethod(profile: Profile): Promise<ConnectMethod> {
   const methods = getConnectMethods(profile);
-  if (methods.length === 1) return methods[0].value;
+  if (methods.length === 1) return methods[0]!.value;
 
-  const { method } = await inquirer.prompt([{
+  const { method } = await inquirer.prompt<{ method: ConnectMethod }>([{
     type: 'list',
     name: 'method',
     message: c.primary('How do you want to connect?'),
@@ -60,7 +59,7 @@ async function pickConnectMethod(profile) {
 
 // ─── Connect ─────────────────────────────────────────────────────────────────
 
-async function menuConnect(prefilter = null) {
+async function menuConnect(prefilter: string | null = null): Promise<void> {
   let profiles = getProfiles();
   if (prefilter) profiles = profiles.filter(p => p.group === prefilter);
 
@@ -71,7 +70,7 @@ async function menuConnect(prefilter = null) {
   }
 
   banner();
-  const { id } = await inquirer.prompt([{
+  const { id } = await inquirer.prompt<{ id: string }>([{
     type: 'list',
     name: 'id',
     message: c.primary.bold('Select a server to connect:'),
@@ -85,17 +84,16 @@ async function menuConnect(prefilter = null) {
 
   if (id === '__back__') return;
 
-  const profile = profiles.find(p => p.id === id);
+  const profile = profiles.find(p => p.id === id)!;
   const method  = await pickConnectMethod(profile);
 
   banner();
-  console.log(c.primary.bold(`  Connecting to: `) + c.secondary(profile.name));
-  console.log(c.muted(`  Method:  `) + c.warning(method));
-  console.log(c.muted(`  Command: `) + c.text(buildSSHCommand(profile, method)));
-
+  console.log(c.primary.bold('  Connecting to: ') + c.secondary(profile.name));
+  console.log(c.muted('  Method:  ') + c.warning(method));
+  console.log(c.muted('  Command: ') + c.text(buildSSHCommand(profile, method)));
   printProfileDetail(profile);
 
-  const { confirm } = await inquirer.prompt([{
+  const { confirm } = await inquirer.prompt<{ confirm: boolean }>([{
     type: 'confirm',
     name: 'confirm',
     message: 'Connect now?',
@@ -111,24 +109,24 @@ async function menuConnect(prefilter = null) {
 
 // ─── Manage ──────────────────────────────────────────────────────────────────
 
-async function menuManage() {
+async function menuManage(): Promise<void> {
   while (true) {
     banner();
     const profiles = getProfiles();
 
-    const choices = profiles.length > 0
+    const profileChoices = profiles.length > 0
       ? [
           ...profiles.map(p => ({ name: profileSummary(p), value: `view:${p.id}` })),
           new inquirer.Separator(),
         ]
       : [{ name: c.muted('(no profiles yet)'), value: '__none__', disabled: true }, new inquirer.Separator()];
 
-    const { action } = await inquirer.prompt([{
+    const { action } = await inquirer.prompt<{ action: string }>([{
       type: 'list',
       name: 'action',
       message: c.primary.bold('Manage Profiles'),
       choices: [
-        ...choices,
+        ...profileChoices,
         { name: `${c.success('+')} Add new profile`, value: '__add__' },
         { name: c.muted('← Back'),                   value: '__back__' },
       ],
@@ -143,25 +141,23 @@ async function menuManage() {
   }
 }
 
-async function menuProfileActions(id) {
+async function menuProfileActions(id: string): Promise<void> {
   const profile = getProfiles().find(p => p.id === id);
   if (!profile) return;
 
   banner();
-  console.log(c.primary.bold(`  Profile: `) + c.secondary(profile.name));
-  console.log(c.muted(`  Host:    `) + c.text(`${profile.user}@${profile.host}:${profile.port}`));
-  if (profile.hostPrivate)         console.log(c.muted(`  Private: `) + c.text(profile.hostPrivate));
-  if (profile.keyPath)             console.log(c.muted(`  Key:     `) + c.text(profile.keyPath));
-  if (profile.jumpHost)            console.log(c.muted(`  Jump:    `) + c.text(profile.jumpHost));
-  if (profile.cloudflaredHostname) console.log(c.muted(`  CF Tunnel: `) + c.primary(profile.cloudflaredHostname));
-  if (profile.proxyCommand)        console.log(c.muted(`  Proxy:   `) + c.text(profile.proxyCommand));
-  if (profile.notes)               console.log(c.muted(`  Notes:   `) + c.text(profile.notes));
+  console.log(c.primary.bold('  Profile: ') + c.secondary(profile.name));
+  console.log(c.muted('  Host:    ') + c.text(`${profile.user}@${profile.host}:${profile.port}`));
+  if (profile.hostPrivate)         console.log(c.muted('  Private: ') + c.text(profile.hostPrivate));
+  if (profile.keyPath)             console.log(c.muted('  Key:     ') + c.text(profile.keyPath));
+  if (profile.jumpHost)            console.log(c.muted('  Jump:    ') + c.text(profile.jumpHost));
+  if (profile.cloudflaredHostname) console.log(c.muted('  CF Tunnel: ') + c.primary(profile.cloudflaredHostname));
+  if (profile.proxyCommand)        console.log(c.muted('  Proxy:   ') + c.text(profile.proxyCommand));
+  if (profile.notes)               console.log(c.muted('  Notes:   ') + c.text(profile.notes));
   printProfileDetail(profile);
   console.log();
 
-  const methods = getConnectMethods(profile);
-
-  const { action } = await inquirer.prompt([{
+  const { action } = await inquirer.prompt<{ action: string }>([{
     type: 'list',
     name: 'action',
     message: 'Actions',
@@ -176,9 +172,9 @@ async function menuProfileActions(id) {
     ],
   }]);
 
-  if (action === 'back')    return;
-  if (action === 'edit')    { await formEditProfile(profile); return; }
-  if (action === 'delete')  { await confirmDelete(id); return; }
+  if (action === 'back')   return;
+  if (action === 'edit')   { await formEditProfile(profile); return; }
+  if (action === 'delete') { await confirmDelete(id); return; }
   if (action === 'copykey') { await menuCopyKey(profile); return; }
 
   if (action === 'connect') {
@@ -198,9 +194,9 @@ async function menuProfileActions(id) {
   }
 }
 
-async function confirmDelete(id) {
+async function confirmDelete(id: string): Promise<void> {
   const profile = getProfiles().find(p => p.id === id);
-  const { yes } = await inquirer.prompt([{
+  const { yes } = await inquirer.prompt<{ yes: boolean }>([{
     type: 'confirm',
     name: 'yes',
     message: c.error(`Delete profile "${profile?.name}"? This cannot be undone.`),
@@ -211,54 +207,60 @@ async function confirmDelete(id) {
 
 // ─── Add / Edit forms ────────────────────────────────────────────────────────
 
-async function formAddProfile() {
+async function formAddProfile(): Promise<void> {
   banner();
   console.log(c.primary.bold('  Add New Profile\n'));
 
   const answers = await askProfileFields({});
-  const profile = { id: nanoid(), tunnels: [], ...answers, createdAt: new Date().toISOString() };
+  const profile: Profile = {
+    ...answers,
+    id: nanoid(),
+    createdAt: new Date().toISOString(),
+  };
 
   if (answers.addTunnels) {
     profile.tunnels = await askTunnels();
   }
-  delete profile.addTunnels;
 
-  saveProfile(profile);
-  msg(`Profile "${profile.name}" saved!`, 'success');
+  const { addTunnels: _drop, ...clean } = profile as Profile & { addTunnels?: boolean };
+  saveProfile(clean);
+  msg(`Profile "${clean.name}" saved!`, 'success');
   await pause();
 }
 
-async function formEditProfile(profile) {
+async function formEditProfile(profile: Profile): Promise<void> {
   banner();
   console.log(c.primary.bold(`  Edit Profile: ${profile.name}\n`));
 
   const answers = await askProfileFields(profile);
-  const updated = { ...profile, ...answers };
+  const updated: Profile = { ...profile, ...answers };
 
   if (answers.addTunnels) {
     updated.tunnels = await askTunnels(profile.tunnels);
   }
-  delete updated.addTunnels;
 
-  saveProfile(updated);
-  msg(`Profile "${updated.name}" updated!`, 'success');
+  const { addTunnels: _drop, ...clean } = updated as Profile & { addTunnels?: boolean };
+  saveProfile(clean);
+  msg(`Profile "${clean.name}" updated!`, 'success');
   await pause();
 }
 
-async function askProfileFields(defaults = {}) {
-  return inquirer.prompt([
+type ProfileFormAnswers = Omit<Profile, 'id' | 'createdAt' | 'lastConnected'> & { addTunnels: boolean };
+
+async function askProfileFields(defaults: Partial<Profile>): Promise<ProfileFormAnswers> {
+  return inquirer.prompt<ProfileFormAnswers>([
     // ── Basic ──────────────────────────────────────────────────────────────
     {
       type: 'input', name: 'name',
       message: 'Profile name (alias):',
       default: defaults.name,
-      validate: v => v.trim() ? true : 'Name is required',
+      validate: (v: string) => v.trim() ? true : 'Name is required',
     },
     {
       type: 'input', name: 'user',
       message: 'SSH user:',
       default: defaults.user ?? 'ubuntu',
-      validate: v => v.trim() ? true : 'User is required',
+      validate: (v: string) => v.trim() ? true : 'User is required',
     },
     {
       type: 'number', name: 'port',
@@ -270,21 +272,19 @@ async function askProfileFields(defaults = {}) {
       message: 'Path to SSH private key (leave blank to skip):',
       default: defaults.keyPath ?? '',
     },
-
     // ── IPs ────────────────────────────────────────────────────────────────
     {
       type: 'input', name: 'host',
       message: `Public IP or hostname ${c.muted('(required)')}:`,
       default: defaults.host,
-      validate: v => v.trim() ? true : 'Public host is required',
+      validate: (v: string) => v.trim() ? true : 'Public host is required',
     },
     {
       type: 'input', name: 'hostPrivate',
-      message: `Private / internal IP ${c.muted('(optional — e.g. GCP internal IP)')}:`,
+      message: `Private / internal IP ${c.muted('(optional — e.g. GCP VPC IP)')}:`,
       default: defaults.hostPrivate ?? '',
     },
-
-    // ── Connectivity options ───────────────────────────────────────────────
+    // ── Routing ────────────────────────────────────────────────────────────
     {
       type: 'input', name: 'jumpHost',
       message: `Jump host / bastion ${c.muted('(user@host:port — optional)')}:`,
@@ -297,10 +297,9 @@ async function askProfileFields(defaults = {}) {
     },
     {
       type: 'input', name: 'proxyCommand',
-      message: `ProxyCommand ${c.muted('(custom proxy, e.g. nc %h %p — optional)')}:`,
+      message: `ProxyCommand ${c.muted('(e.g. nc %h %p — optional)')}:`,
       default: defaults.proxyCommand ?? '',
     },
-
     // ── Metadata ───────────────────────────────────────────────────────────
     {
       type: 'list', name: 'group',
@@ -312,7 +311,7 @@ async function askProfileFields(defaults = {}) {
       type: 'input', name: 'tags',
       message: `Tags ${c.muted('(comma-separated, e.g. k8s,web)')}:`,
       default: (defaults.tags ?? []).join(','),
-      filter: v => v.split(',').map(t => t.trim()).filter(Boolean),
+      filter: (v: string) => v.split(',').map((t: string) => t.trim()).filter(Boolean),
     },
     {
       type: 'input', name: 'notes',
@@ -329,8 +328,8 @@ async function askProfileFields(defaults = {}) {
 
 // ─── Tunnel wizard ────────────────────────────────────────────────────────────
 
-async function askTunnels(existing = []) {
-  const tunnels = [...existing];
+async function askTunnels(existing: Tunnel[] = []): Promise<Tunnel[]> {
+  const tunnels: Tunnel[] = [...existing];
 
   while (true) {
     banner();
@@ -344,13 +343,13 @@ async function askTunnels(existing = []) {
       console.log();
     }
 
-    const { action } = await inquirer.prompt([{
+    const { action } = await inquirer.prompt<{ action: string }>([{
       type: 'list', name: 'action',
       message: 'Tunnels',
       choices: [
-        { name: '+ Add local port forward (L)  — e.g. forward remote DB to localhost',  value: 'local' },
-        { name: '+ Add remote port forward (R) — e.g. expose local port on server',      value: 'remote' },
-        { name: '+ Add dynamic SOCKS proxy (D) — route traffic through server',          value: 'dynamic' },
+        { name: '+ Add local port forward (L)  — forward remote service to localhost', value: 'local' },
+        { name: '+ Add remote port forward (R) — expose local port on server',          value: 'remote' },
+        { name: '+ Add dynamic SOCKS proxy (D) — route traffic through server',         value: 'dynamic' },
         ...(tunnels.length > 0 ? [{ name: c.error('✗ Remove a tunnel'), value: 'remove' }] : []),
         new inquirer.Separator(),
         { name: c.success('✓ Done'), value: 'done' },
@@ -360,7 +359,7 @@ async function askTunnels(existing = []) {
     if (action === 'done') break;
 
     if (action === 'remove') {
-      const { idx } = await inquirer.prompt([{
+      const { idx } = await inquirer.prompt<{ idx: number }>([{
         type: 'list', name: 'idx',
         message: 'Which tunnel to remove?',
         choices: tunnels.map((t, i) => ({
@@ -375,17 +374,17 @@ async function askTunnels(existing = []) {
     }
 
     if (action === 'dynamic') {
-      const { localPort } = await inquirer.prompt([
+      const { localPort } = await inquirer.prompt<{ localPort: number }>([
         { type: 'number', name: 'localPort', message: 'Local SOCKS port:', default: 1080 },
       ]);
       tunnels.push({ type: 'dynamic', localPort });
     } else {
-      const t = await inquirer.prompt([
+      const t = await inquirer.prompt<{ localPort: number; remoteHost: string; remotePort: number }>([
         { type: 'number', name: 'localPort',  message: 'Local port:',   default: 8080 },
         { type: 'input',  name: 'remoteHost', message: 'Remote host:',  default: 'localhost' },
         { type: 'number', name: 'remotePort', message: 'Remote port:',  default: 80 },
       ]);
-      tunnels.push({ type: action, ...t });
+      tunnels.push({ type: action as 'local' | 'remote', ...t });
     }
   }
 
@@ -394,7 +393,7 @@ async function askTunnels(existing = []) {
 
 // ─── Groups ──────────────────────────────────────────────────────────────────
 
-async function menuGroups() {
+async function menuGroups(): Promise<void> {
   const groups = getGroups();
 
   if (groups.length === 0) {
@@ -404,7 +403,7 @@ async function menuGroups() {
   }
 
   banner();
-  const { group } = await inquirer.prompt([{
+  const { group } = await inquirer.prompt<{ group: string }>([{
     type: 'list',
     name: 'group',
     message: c.primary.bold('Browse by group:'),
@@ -423,7 +422,7 @@ async function menuGroups() {
 
 // ─── Search ──────────────────────────────────────────────────────────────────
 
-async function menuSearch() {
+async function menuSearch(): Promise<void> {
   const profiles = getProfiles();
   if (profiles.length === 0) {
     msg('No profiles to search.', 'error');
@@ -432,7 +431,7 @@ async function menuSearch() {
   }
 
   banner();
-  const { query } = await inquirer.prompt([{
+  const { query } = await inquirer.prompt<{ query: string }>([{
     type: 'input',
     name: 'query',
     message: c.primary('Search (name, host, private IP, user, tags, group):'),
@@ -453,7 +452,7 @@ async function menuSearch() {
     return;
   }
 
-  const { id } = await inquirer.prompt([{
+  const { id } = await inquirer.prompt<{ id: string }>([{
     type: 'list',
     name: 'id',
     message: c.primary(`Found ${results.length} result(s):`),
@@ -470,10 +469,10 @@ async function menuSearch() {
 
 // ─── Copy SSH key ─────────────────────────────────────────────────────────────
 
-async function menuCopyKey(preselect = null) {
+async function menuCopyKey(preselect: Profile | null = null): Promise<void> {
   banner();
   console.log(c.primary.bold('  Copy SSH Key to Server\n'));
-  console.log(c.muted('  This runs ssh-copy-id to push your public key to the remote server.\n'));
+  console.log(c.muted('  Runs ssh-copy-id to push your public key to the remote server.\n'));
 
   let profile = preselect;
 
@@ -484,7 +483,7 @@ async function menuCopyKey(preselect = null) {
       await pause();
       return;
     }
-    const { id } = await inquirer.prompt([{
+    const { id } = await inquirer.prompt<{ id: string }>([{
       type: 'list',
       name: 'id',
       message: 'Select target server:',
@@ -496,14 +495,14 @@ async function menuCopyKey(preselect = null) {
       pageSize: 15,
     }]);
     if (id === '__back__') return;
-    profile = profiles.find(p => p.id === id);
+    profile = profiles.find(p => p.id === id)!;
   }
 
-  // Pick IP if private is available
+  // Only show public/private for key copy (CF tunnel / ProxyCommand don't support it)
   const methods = getConnectMethods(profile).filter(m => m.value === 'public' || m.value === 'private');
-  let method = 'public';
+  let method: ConnectMethod = 'public';
   if (methods.length > 1) {
-    const { m } = await inquirer.prompt([{
+    const { m } = await inquirer.prompt<{ m: ConnectMethod }>([{
       type: 'list', name: 'm',
       message: 'Copy key via which IP?',
       choices: methods.map(m => ({ name: m.name, value: m.value })),
@@ -511,7 +510,7 @@ async function menuCopyKey(preselect = null) {
     method = m;
   }
 
-  const { keyPath } = await inquirer.prompt([{
+  const { keyPath } = await inquirer.prompt<{ keyPath: string }>([{
     type: 'input',
     name: 'keyPath',
     message: 'Path to your PUBLIC key (.pub):',
@@ -520,7 +519,7 @@ async function menuCopyKey(preselect = null) {
 
   const targetHost = method === 'private' ? profile.hostPrivate : profile.host;
 
-  const { confirm } = await inquirer.prompt([{
+  const { confirm } = await inquirer.prompt<{ confirm: boolean }>([{
     type: 'confirm',
     name: 'confirm',
     message: `Copy ${c.warning(keyPath)} to ${c.secondary(`${profile.user}@${targetHost}`)}?`,
@@ -541,30 +540,26 @@ async function menuCopyKey(preselect = null) {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-function printProfileDetail(profile) {
-  if (profile.tunnels?.length) {
-    console.log(c.warning(`  Tunnels:`));
+function printProfileDetail(profile: Profile): void {
+  if (profile.tunnels.length) {
+    console.log(c.warning('  Tunnels:'));
     profile.tunnels.forEach(t => {
       if (t.type === 'local')   console.log(c.muted(`    L  localhost:${t.localPort} → ${t.remoteHost}:${t.remotePort}`));
       if (t.type === 'remote')  console.log(c.muted(`    R  remote:${t.localPort} → ${t.remoteHost}:${t.remotePort}`));
       if (t.type === 'dynamic') console.log(c.muted(`    D  SOCKS proxy on localhost:${t.localPort}`));
     });
   }
-  if (profile.jumpHost) {
-    console.log(c.warning(`  Jump host: `) + c.muted(profile.jumpHost));
-  }
-  if (profile.notes) {
-    console.log(c.muted(`  Notes: `) + c.text(profile.notes));
-  }
+  if (profile.jumpHost)  console.log(c.warning('  Jump host: ') + c.muted(profile.jumpHost));
+  if (profile.notes)     console.log(c.muted('  Notes: ') + c.text(profile.notes));
 }
 
-function pause() {
-  return inquirer.prompt([{ type: 'input', name: '_', message: c.muted('Press Enter to continue...') }]);
+function pause(): Promise<void> {
+  return inquirer.prompt([{ type: 'input', name: '_', message: c.muted('Press Enter to continue...') }]).then(() => {});
 }
 
 // ─── Run ─────────────────────────────────────────────────────────────────────
 
-main().catch(err => {
+main().catch((err: Error) => {
   console.error(c.error('\nFatal error:'), err.message);
   process.exit(1);
 });

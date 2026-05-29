@@ -1,19 +1,18 @@
 import { execFileSync, spawn } from 'child_process';
+import type { Profile, ConnectMethod, ConnectMethodOption } from './types.js';
 
-// ── Input sanitization ────────────────────────────────────────────────────────
+// ── Input validation ──────────────────────────────────────────────────────────
 
-const SAFE_HOSTNAME    = /^[a-zA-Z0-9._%-]+$/;
-const SAFE_USER        = /^[a-zA-Z0-9._-]+$/;
-const SAFE_PATH        = /^[^\0;|&`$<>]+$/;
-const SAFE_PORT        = /^\d{1,5}$/;
-const SAFE_JUMP        = /^[a-zA-Z0-9._%-]+@[a-zA-Z0-9._%-]+(:\d{1,5})?$/;
-const SAFE_CF_HOST     = /^[a-zA-Z0-9._%-]+$/;  // cloudflare tunnel hostname
-// ProxyCommand is intentionally not stripped — it is a shell command by design.
-// We only block null bytes and warn the user during input.
-const SAFE_PROXY_CMD   = /^[^\0]+$/;
+const SAFE_HOSTNAME  = /^[a-zA-Z0-9._%-]+$/;
+const SAFE_USER      = /^[a-zA-Z0-9._-]+$/;
+const SAFE_PATH      = /^[^\0;|&`$<>]+$/;
+const SAFE_PORT      = /^\d{1,5}$/;
+const SAFE_JUMP      = /^[a-zA-Z0-9._%-]+@[a-zA-Z0-9._%-]+(:\d{1,5})?$/;
+const SAFE_CF_HOST   = /^[a-zA-Z0-9._%-]+$/;
+const SAFE_PROXY_CMD = /^[^\0]+$/;
 
-export function validateProfile(profile) {
-  const errors = [];
+export function validateProfile(profile: Profile): string[] {
+  const errors: string[] = [];
 
   if (!SAFE_HOSTNAME.test(profile.host))
     errors.push(`Invalid hostname: "${profile.host}"`);
@@ -31,7 +30,7 @@ export function validateProfile(profile) {
     errors.push(`Unsafe key path: "${profile.keyPath}"`);
 
   if (profile.jumpHost && !SAFE_JUMP.test(profile.jumpHost))
-    errors.push(`Invalid jump host format: "${profile.jumpHost}" (expected user@host or user@host:port)`);
+    errors.push(`Invalid jump host: "${profile.jumpHost}" (expected user@host or user@host:port)`);
 
   if (profile.cloudflaredHostname && !SAFE_CF_HOST.test(profile.cloudflaredHostname))
     errors.push(`Invalid Cloudflare tunnel hostname: "${profile.cloudflaredHostname}"`);
@@ -39,7 +38,7 @@ export function validateProfile(profile) {
   if (profile.proxyCommand && !SAFE_PROXY_CMD.test(profile.proxyCommand))
     errors.push('ProxyCommand contains null bytes — rejected.');
 
-  for (const t of (profile.tunnels || [])) {
+  for (const t of profile.tunnels) {
     if (!SAFE_PORT.test(String(t.localPort)))
       errors.push(`Invalid tunnel local port: "${t.localPort}"`);
     if (t.remoteHost && !SAFE_HOSTNAME.test(t.remoteHost))
@@ -52,68 +51,57 @@ export function validateProfile(profile) {
 }
 
 // ── Connection methods ────────────────────────────────────────────────────────
-// Returns the list of available connect methods for a given profile.
 
-export function getConnectMethods(profile) {
-  const methods = [
-    { value: 'public',  name: `Public IP / hostname  (${profile.host})` },
+export function getConnectMethods(profile: Profile): ConnectMethodOption[] {
+  const methods: ConnectMethodOption[] = [
+    { value: 'public', name: `Public IP / hostname  (${profile.host})` },
   ];
 
   if (profile.hostPrivate) {
-    methods.push({ value: 'private', name: `Private / internal IP   (${profile.hostPrivate})` });
+    methods.push({ value: 'private', name: `Private / internal IP  (${profile.hostPrivate})` });
   }
-
   if (profile.cloudflaredHostname) {
-    methods.push({ value: 'cloudflared', name: `Cloudflare Tunnel       (${profile.cloudflaredHostname})` });
+    methods.push({ value: 'cloudflared', name: `Cloudflare Tunnel      (${profile.cloudflaredHostname})` });
   }
-
   if (profile.proxyCommand) {
-    methods.push({ value: 'proxy', name: `ProxyCommand            (${profile.proxyCommand.slice(0, 50)}${profile.proxyCommand.length > 50 ? '…' : ''})` });
+    const preview = profile.proxyCommand.length > 50
+      ? `${profile.proxyCommand.slice(0, 50)}…`
+      : profile.proxyCommand;
+    methods.push({ value: 'proxy', name: `ProxyCommand           (${preview})` });
   }
 
   return methods;
 }
 
 // ── SSH arg builder ───────────────────────────────────────────────────────────
-// method: 'public' | 'private' | 'cloudflared' | 'proxy'
 
-export function buildSSHArgs(profile, method = 'public') {
+export function buildSSHArgs(profile: Profile, method: ConnectMethod = 'public'): string[] {
   const errors = validateProfile(profile);
   if (errors.length > 0) {
     throw new Error(`Profile validation failed:\n  ${errors.join('\n  ')}`);
   }
 
-  const args = [];
+  const args: string[] = [];
 
-  // ── Port ──
-  if (profile.port && profile.port !== 22) {
+  if (profile.port !== 22) {
     args.push('-p', String(profile.port));
   }
-
-  // ── Key ──
   if (profile.keyPath) {
     args.push('-i', profile.keyPath);
   }
 
-  // ── ProxyCommand / Cloudflared ──
-  // Note: ProxyCommand must be passed as a single -o option string.
-  // We use spawn with shell:false so this string is handed directly
-  // to ssh — ssh itself parses and invokes the ProxyCommand via sh.
   if (method === 'cloudflared') {
-    const cfHost = profile.cloudflaredHostname;
-    args.push('-o', `ProxyCommand=cloudflared access ssh --hostname ${cfHost}`);
-    // Cloudflare tunnels handle auth — skip jump hosts to avoid conflicts
+    args.push('-o', `ProxyCommand=cloudflared access ssh --hostname ${profile.cloudflaredHostname}`);
   } else if (method === 'proxy') {
     args.push('-o', `ProxyCommand=${profile.proxyCommand}`);
   } else {
-    // Only use jump host for direct IP connections
+    // Jump host only for direct IP connections
     if (profile.jumpHost) {
       args.push('-J', profile.jumpHost);
     }
   }
 
-  // ── Tunnels ──
-  for (const t of (profile.tunnels || [])) {
+  for (const t of profile.tunnels) {
     if (t.type === 'local') {
       args.push('-L', `${t.localPort}:${t.remoteHost}:${t.remotePort}`);
     } else if (t.type === 'remote') {
@@ -123,48 +111,50 @@ export function buildSSHArgs(profile, method = 'public') {
     }
   }
 
-  // ── Target host ──
-  const host = method === 'private'
-    ? profile.hostPrivate
-    : method === 'cloudflared'
-      ? profile.cloudflaredHostname
-      : profile.host;
+  const host =
+    method === 'private'     ? profile.hostPrivate! :
+    method === 'cloudflared' ? profile.cloudflaredHostname! :
+    profile.host;
 
   args.push(`${profile.user}@${host}`);
   return args;
 }
 
-export function buildSSHCommand(profile, method = 'public') {
+export function buildSSHCommand(profile: Profile, method: ConnectMethod = 'public'): string {
   return `ssh ${buildSSHArgs(profile, method).join(' ')}`;
 }
 
 // ── Connections — shell: false, args as array ─────────────────────────────────
 
-export function connect(profile, method = 'public') {
+export function connect(profile: Profile, method: ConnectMethod = 'public'): void {
   const args = buildSSHArgs(profile, method);
   const child = spawn('ssh', args, { stdio: 'inherit', shell: false });
-  child.on('exit', code => process.exit(code ?? 0));
+  child.on('exit', (code: number | null) => process.exit(code ?? 0));
 }
 
-export function copySSHKey(profile, keyPath, method = 'public') {
+export function copySSHKey(
+  profile: Profile,
+  keyPath: string,
+  method: ConnectMethod = 'public',
+): { success: boolean; error?: string } {
   if (!SAFE_PATH.test(keyPath)) {
     return { success: false, error: 'Unsafe key path — contains shell special characters.' };
   }
 
-  const host = method === 'private' ? profile.hostPrivate : profile.host;
-  const args = [];
-  if (profile.port && profile.port !== 22) args.push('-p', String(profile.port));
+  const host = method === 'private' ? profile.hostPrivate! : profile.host;
+  const args: string[] = [];
+  if (profile.port !== 22) args.push('-p', String(profile.port));
   args.push('-i', keyPath, `${profile.user}@${host}`);
 
   try {
     execFileSync('ssh-copy-id', args, { stdio: 'inherit' });
     return { success: true };
   } catch (err) {
-    return { success: false, error: err.message };
+    return { success: false, error: (err as Error).message };
   }
 }
 
-export function testConnection(profile, method = 'public') {
+export function testConnection(profile: Profile, method: ConnectMethod = 'public'): boolean {
   try {
     const args = [
       '-o', 'ConnectTimeout=5',
