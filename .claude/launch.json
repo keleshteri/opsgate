@@ -1,0 +1,23 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "OpsGate CLI (build + run)",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev"],
+      "port": null
+    },
+    {
+      "name": "TypeScript watch (compiler only)",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "build:watch"],
+      "port": null
+    },
+    {
+      "name": "OpsGate CLI (prebuilt)",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["dist/index.js"],
+      "port": null
+    }
+  ]
+}

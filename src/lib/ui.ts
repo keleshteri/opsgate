@@ -41,12 +41,13 @@ export function msg(text: string, type: 'success' | 'error' | 'info' = 'info'): 
 }
 
 export function profileSummary(p: Profile): string {
-  const tunnelInfo = p.tunnels.length   ? c.primary(` ⇄${p.tunnels.length}`) : '';
-  const jumpInfo   = p.jumpHost         ? c.warning(' ⤷J') : '';
-  const cfInfo     = p.cloudflaredHostname ? c.primary(' ☁CF') : '';
-  const proxyInfo  = p.proxyCommand     ? c.muted(' ⇢P') : '';
-  const privateInfo = p.hostPrivate     ? c.muted(' +priv') : '';
-  const keyInfo    = p.keyPath          ? c.success(' 🔑') : '';
+  const tunnelInfo  = p.tunnels.length        ? c.primary(` ⇄${p.tunnels.length}`) : '';
+  const jumpInfo    = p.jumpHost              ? c.warning(' ⤷J') : '';
+  const cfInfo      = p.cloudflaredHostname   ? c.primary(' ☁CF') : '';
+  const proxyInfo   = p.proxyCommand          ? c.muted(' ⇢P') : '';
+  const privateInfo = p.hostPrivate           ? c.muted(' +priv') : '';
+  const aliasInfo   = p.sshConfigAlias        ? c.warning(` [~/.ssh/config: ${p.sshConfigAlias}]`) : '';
+  const keyInfo     = p.keyPath               ? c.success(' 🔑') : '';
   const last       = p.lastConnected
     ? c.muted(` (${new Date(p.lastConnected).toLocaleDateString()})`)
     : c.muted(' (never)');
@@ -56,6 +57,6 @@ export function profileSummary(p: Profile): string {
     c.muted('  ') + c.secondary(`${p.user}@${p.host}`) +
     (p.port !== 22 ? c.muted(`:${p.port}`) : '') +
     '  ' + groupColor(p.group) +
-    tunnelInfo + jumpInfo + cfInfo + proxyInfo + privateInfo + keyInfo + last
+    tunnelInfo + jumpInfo + cfInfo + proxyInfo + privateInfo + aliasInfo + keyInfo + last
   );
 }

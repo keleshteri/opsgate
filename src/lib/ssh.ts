@@ -1,4 +1,4 @@
-import { execFileSync, spawnSync, spawn } from 'child_process';
+import { execFileSync, spawnSync } from 'child_process';
 import type { Profile, ConnectMethod, ConnectMethodOption } from './types.js';
 
 // ── Input validation ──────────────────────────────────────────────────────────
@@ -10,9 +10,18 @@ const SAFE_PORT      = /^\d{1,5}$/;
 const SAFE_JUMP      = /^[a-zA-Z0-9._%-]+@[a-zA-Z0-9._%-]+(:\d{1,5})?$/;
 const SAFE_CF_HOST   = /^[a-zA-Z0-9._%-]+$/;
 const SAFE_PROXY_CMD = /^[^\0]+$/;
+// SSH config alias: allows colons and slashes (e.g. vm:us-db-prod)
+const SAFE_ALIAS     = /^[a-zA-Z0-9._:/-]+$/;
 
 export function validateProfile(profile: Profile): string[] {
   const errors: string[] = [];
+
+  if (profile.sshConfigAlias) {
+    // Alias mode — only validate the alias itself
+    if (!SAFE_ALIAS.test(profile.sshConfigAlias))
+      errors.push(`Invalid SSH config alias: "${profile.sshConfigAlias}"`);
+    return errors;
+  }
 
   if (!SAFE_HOSTNAME.test(profile.host))
     errors.push(`Invalid hostname: "${profile.host}"`);
@@ -53,8 +62,23 @@ export function validateProfile(profile: Profile): string[] {
 // ── Connection methods ────────────────────────────────────────────────────────
 
 export function getConnectMethods(profile: Profile): ConnectMethodOption[] {
+  // If profile has an SSH config alias, that's the primary method
+  if (profile.sshConfigAlias) {
+    const methods: ConnectMethodOption[] = [
+      { value: 'alias', name: `SSH config alias       (~/.ssh/config → ${profile.sshConfigAlias})` },
+    ];
+    // Still allow direct public IP if host looks like a real IP/hostname
+    if (profile.host && profile.host !== profile.sshConfigAlias) {
+      methods.push({ value: 'public', name: `Public IP / hostname   (${profile.host})` });
+    }
+    if (profile.hostPrivate) {
+      methods.push({ value: 'private', name: `Private / internal IP  (${profile.hostPrivate})` });
+    }
+    return methods;
+  }
+
   const methods: ConnectMethodOption[] = [
-    { value: 'public', name: `Public IP / hostname  (${profile.host})` },
+    { value: 'public', name: `Public IP / hostname   (${profile.host})` },
   ];
 
   if (profile.hostPrivate) {
@@ -81,6 +105,17 @@ export function buildSSHArgs(profile: Profile, method: ConnectMethod = 'public')
     throw new Error(`Profile validation failed:\n  ${errors.join('\n  ')}`);
   }
 
+  // ── Alias mode: delegate entirely to ~/.ssh/config ──
+  if (method === 'alias' && profile.sshConfigAlias) {
+    // SSH reads ~/.ssh/config and resolves all routing from the alias.
+    // Only add key override if specified (SSH config IdentityFile takes
+    // precedence anyway, but explicit -i lets the user override it).
+    const args: string[] = [];
+    if (profile.keyPath) args.push('-i', profile.keyPath);
+    args.push(profile.sshConfigAlias);
+    return args;
+  }
+
   const args: string[] = [];
 
   if (profile.port !== 22) {
@@ -91,6 +126,7 @@ export function buildSSHArgs(profile: Profile, method: ConnectMethod = 'public')
   }
 
   if (method === 'cloudflared') {
+    // Direct Cloudflare Tunnel connection (VM is the CF tunnel endpoint)
     args.push('-o', `ProxyCommand=cloudflared access ssh --hostname ${profile.cloudflaredHostname}`);
   } else if (method === 'proxy') {
     args.push('-o', `ProxyCommand=${profile.proxyCommand}`);
@@ -121,16 +157,17 @@ export function buildSSHArgs(profile: Profile, method: ConnectMethod = 'public')
 }
 
 export function buildSSHCommand(profile: Profile, method: ConnectMethod = 'public'): string {
+  if (method === 'alias' && profile.sshConfigAlias) {
+    const key = profile.keyPath ? `-i ${profile.keyPath} ` : '';
+    return `ssh ${key}${profile.sshConfigAlias}`;
+  }
   return `ssh ${buildSSHArgs(profile, method).join(' ')}`;
 }
 
-// ── Connections — shell: false, args as array ─────────────────────────────────
+// ── Connections — spawnSync blocks Node while SSH runs ────────────────────────
 
 export function connect(profile: Profile, method: ConnectMethod = 'public'): void {
   const args = buildSSHArgs(profile, method);
-  // spawnSync blocks the Node.js process entirely while SSH runs.
-  // This prevents the main menu loop from continuing and calling
-  // console.clear() which would corrupt the SSH terminal session.
   const result = spawnSync('ssh', args, { stdio: 'inherit', shell: false });
   process.exit(result.status ?? 0);
 }

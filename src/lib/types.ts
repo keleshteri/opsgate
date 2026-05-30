@@ -15,7 +15,7 @@ export interface Profile {
 
   // ── Connection targets ──────────────────────────────────────────────────
   host: string;              // public IP or hostname (required)
-  hostPrivate?: string;      // private / internal IP (optional, e.g. GCP VPC)
+  hostPrivate?: string;      // private / internal IP (e.g. GCP VPC)
   user: string;
   port: number;
 
@@ -24,8 +24,9 @@ export interface Profile {
 
   // ── Routing ────────────────────────────────────────────────────────────
   jumpHost?: string;            // bastion: user@host:port
-  cloudflaredHostname?: string; // cloudflare tunnel hostname
-  proxyCommand?: string;        // custom ProxyCommand
+  cloudflaredHostname?: string; // cloudflare tunnel entry hostname
+  proxyCommand?: string;        // fully custom ProxyCommand
+  sshConfigAlias?: string;      // delegate to ~/.ssh/config Host entry (e.g. vm:us-db-prod)
 
   // ── Tunnels ────────────────────────────────────────────────────────────
   tunnels: Tunnel[];
@@ -40,7 +41,7 @@ export interface Profile {
 
 // ── Connect method ────────────────────────────────────────────────────────────
 
-export type ConnectMethod = 'public' | 'private' | 'cloudflared' | 'proxy';
+export type ConnectMethod = 'public' | 'private' | 'cloudflared' | 'proxy' | 'alias';
 
 export interface ConnectMethodOption {
   value: ConnectMethod;
@@ -51,4 +52,16 @@ export interface ConnectMethodOption {
 
 export interface StoreSchema {
   profiles: Profile[];
+}
+
+// ── SSH config import ─────────────────────────────────────────────────────────
+
+export interface SSHConfigHost {
+  alias: string;
+  hostname?: string;
+  user?: string;
+  port?: number;
+  identityFile?: string;
+  proxyJump?: string;
+  proxyCommand?: string;
 }

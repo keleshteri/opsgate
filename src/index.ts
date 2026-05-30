@@ -5,6 +5,7 @@ import Fuse from 'fuse.js';
 import { c, banner, msg, profileSummary, groupColor } from './lib/ui.js';
 import { getProfiles, saveProfile, deleteProfile, getGroups, touchProfile, storePath } from './lib/store.js';
 import { connect, copySSHKey, buildSSHCommand, testConnection, getConnectMethods } from './lib/ssh.js';
+import { parseSSHConfig, sshConfigExists, sshConfigPath } from './lib/sshconfig.js';
 import type { Profile, Tunnel, ConnectMethod } from './lib/types.js';
 
 // ─── Main loop ───────────────────────────────────────────────────────────────
@@ -26,6 +27,7 @@ async function main(): Promise<void> {
         { name: `${c.secondary('📁')} Browse by group`,      value: 'groups' },
         { name: `${c.primary('🔍')} Search profiles`,        value: 'search' },
         { name: `${c.success('🔑')} Copy SSH key to server`, value: 'copykey' },
+        { name: `${c.warning('📥')} Import from ~/.ssh/config`, value: 'import' },
         new inquirer.Separator(),
         { name: `${c.muted('✕')} Exit`,                      value: 'exit' },
       ],
@@ -38,6 +40,7 @@ async function main(): Promise<void> {
     if (action === 'groups')   await menuGroups();
     if (action === 'search')   await menuSearch();
     if (action === 'copykey')  await menuCopyKey();
+    if (action === 'import')   await menuImportSSHConfig();
   }
 }
 
@@ -272,32 +275,42 @@ async function askProfileFields(defaults: Partial<Profile>): Promise<ProfileForm
       message: 'Path to SSH private key (leave blank to skip):',
       default: defaults.keyPath ?? '',
     },
+    // ── SSH Config Alias ───────────────────────────────────────────────────
+    // If set, OpsGate delegates routing entirely to ~/.ssh/config.
+    // Use this for complex setups like CF tunnel + ProxyJump chains.
+    {
+      type: 'input', name: 'sshConfigAlias',
+      message: `SSH config alias ${c.muted('(e.g. vm:us-db-prod from ~/.ssh/config — optional)')}:`,
+      default: defaults.sshConfigAlias ?? '',
+    },
+
     // ── IPs ────────────────────────────────────────────────────────────────
     {
       type: 'input', name: 'host',
-      message: `Public IP or hostname ${c.muted('(required)')}:`,
+      message: `Public IP or hostname ${c.muted('(required — or CF tunnel hostname if alias not set)')}:`,
       default: defaults.host,
       validate: (v: string) => v.trim() ? true : 'Public host is required',
     },
     {
       type: 'input', name: 'hostPrivate',
-      message: `Private / internal IP ${c.muted('(optional — e.g. GCP VPC IP)')}:`,
+      message: `Private / internal IP ${c.muted('(optional — e.g. GCP VPC IP 10.x.x.x)')}:`,
       default: defaults.hostPrivate ?? '',
     },
+
     // ── Routing ────────────────────────────────────────────────────────────
     {
-      type: 'input', name: 'jumpHost',
-      message: `Jump host / bastion ${c.muted('(user@host:port — optional)')}:`,
-      default: defaults.jumpHost ?? '',
-    },
-    {
       type: 'input', name: 'cloudflaredHostname',
-      message: `Cloudflare Tunnel hostname ${c.muted('(e.g. ssh.example.com — optional)')}:`,
+      message: `Cloudflare Tunnel hostname ${c.muted('(e.g. ssh.fentufsm.com — optional)')}:`,
       default: defaults.cloudflaredHostname ?? '',
     },
     {
+      type: 'input', name: 'jumpHost',
+      message: `Jump host / bastion ${c.muted('(user@host:port — optional, for direct network access)')}:`,
+      default: defaults.jumpHost ?? '',
+    },
+    {
       type: 'input', name: 'proxyCommand',
-      message: `ProxyCommand ${c.muted('(e.g. nc %h %p — optional)')}:`,
+      message: `ProxyCommand ${c.muted('(optional — overrides all routing above)')}:`,
       default: defaults.proxyCommand ?? '',
     },
     // ── Metadata ───────────────────────────────────────────────────────────
@@ -536,6 +549,112 @@ async function menuCopyKey(preselect: Profile | null = null): Promise<void> {
     }
     await pause();
   }
+}
+
+// ─── Import from ~/.ssh/config ───────────────────────────────────────────────
+
+async function menuImportSSHConfig(): Promise<void> {
+  banner();
+  console.log(c.primary.bold('  Import from ~/.ssh/config\n'));
+
+  if (!sshConfigExists()) {
+    msg(`No SSH config found at ${sshConfigPath}`, 'error');
+    await pause();
+    return;
+  }
+
+  const hosts = parseSSHConfig();
+  if (hosts.length === 0) {
+    msg('No usable host entries found in ~/.ssh/config', 'error');
+    await pause();
+    return;
+  }
+
+  const existing = getProfiles();
+
+  // Show each host entry with a checkbox — pre-check ones not yet imported
+  const choices = hosts.map(h => {
+    const alreadyImported = existing.some(
+      p => p.sshConfigAlias === h.alias || p.host === (h.hostname ?? h.alias),
+    );
+    return {
+      name: [
+        c.bold(h.alias.padEnd(28)),
+        h.hostname ? c.secondary(h.hostname) : c.muted('(no hostname)'),
+        h.user    ? c.muted(` ${h.user}`) : '',
+        h.proxyJump    ? c.warning(' ⤷J') : '',
+        h.proxyCommand ? c.primary(' ⇢P') : '',
+        alreadyImported ? c.muted(' (already imported)') : '',
+      ].join(''),
+      value: h.alias,
+      checked: !alreadyImported,
+    };
+  });
+
+  const { selected } = await inquirer.prompt<{ selected: string[] }>([{
+    type: 'checkbox',
+    name: 'selected',
+    message: 'Select hosts to import (space to toggle, enter to confirm):',
+    choices,
+    pageSize: 20,
+  }]);
+
+  if (selected.length === 0) {
+    msg('Nothing selected.', 'info');
+    await pause();
+    return;
+  }
+
+  // Ask group for all imported profiles
+  const { group } = await inquirer.prompt<{ group: string }>([{
+    type: 'list',
+    name: 'group',
+    message: 'Assign environment group to imported profiles:',
+    choices: ['dev', 'staging', 'prod', 'database', 'monitoring', 'custom'],
+    default: 'dev',
+  }]);
+
+  let imported = 0;
+  let skipped = 0;
+
+  for (const alias of selected) {
+    const h = hosts.find(x => x.alias === alias)!;
+
+    // Don't overwrite an existing profile with same alias
+    if (existing.some(p => p.sshConfigAlias === alias)) {
+      skipped++;
+      continue;
+    }
+
+    const profile: Profile = {
+      id: nanoid(),
+      name: alias,
+      user: h.user ?? 'ubuntu',
+      port: h.port ?? 22,
+      host: h.hostname ?? alias,         // fallback to alias if no HostName
+      hostPrivate: undefined,
+      keyPath: h.identityFile,
+      sshConfigAlias: alias,             // delegate routing to SSH config
+      jumpHost: undefined,
+      cloudflaredHostname: undefined,
+      proxyCommand: undefined,
+      tunnels: [],
+      group,
+      tags: [],
+      notes: [
+        h.proxyJump    ? `ProxyJump: ${h.proxyJump}` : '',
+        h.proxyCommand ? `ProxyCommand: ${h.proxyCommand}` : '',
+      ].filter(Boolean).join(' | ') || undefined,
+      createdAt: new Date().toISOString(),
+    };
+
+    saveProfile(profile);
+    imported++;
+  }
+
+  console.log();
+  msg(`Imported ${imported} profile${imported !== 1 ? 's' : ''}${skipped ? `, skipped ${skipped} (already exist)` : ''}.`, 'success');
+  await pause();
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
