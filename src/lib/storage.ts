@@ -1,5 +1,5 @@
 import { mkdirSync, readdirSync, statSync, existsSync, unlinkSync } from 'fs';
-import { join } from 'path';
+import { join, basename } from 'path';
 import { homedir } from 'os';
 
 const BASE_DIR = join(homedir(), '.local', 'share', 'opsgate');
@@ -8,6 +8,7 @@ export const DIRS = {
   base:    BASE_DIR,
   backups: join(BASE_DIR, 'backups'),
   logs:    join(BASE_DIR, 'logs'),
+  files:   join(BASE_DIR, 'files'),
 };
 
 // Create all storage directories on first use
@@ -29,6 +30,12 @@ export function getLogDir(profileId: string): string {
   return dir;
 }
 
+export function getFilesDir(profileId: string): string {
+  const dir = join(DIRS.files, profileId);
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
 // ── Timestamp helpers ─────────────────────────────────────────────────────────
 
 export function timestamp(): string {
@@ -46,21 +53,19 @@ export function formatDate(iso: string): string {
   return new Date(iso).toLocaleString();
 }
 
-// ── List local backup files for a profile ─────────────────────────────────────
+// ── Generic local file listing (backups, logs, pulled files) ──────────────────
 
-export interface LocalBackupFile {
+export interface LocalFile {
   fileName: string;
   filePath: string;
   fileSizeBytes: number;
   mtime: Date;
 }
 
-export function listLocalBackups(profileId: string): LocalBackupFile[] {
-  const dir = join(DIRS.backups, profileId);
+function listDir(dir: string, extensions?: string[]): LocalFile[] {
   if (!existsSync(dir)) return [];
-
   return readdirSync(dir)
-    .filter(f => f.endsWith('.sql.gz') || f.endsWith('.sql') || f.endsWith('.gz'))
+    .filter(f => !extensions || extensions.some(ext => f.endsWith(ext)))
     .map(f => {
       const filePath = join(dir, f);
       const stat = statSync(filePath);
@@ -69,6 +74,25 @@ export function listLocalBackups(profileId: string): LocalBackupFile[] {
     .sort((a, b) => b.mtime.getTime() - a.mtime.getTime()); // newest first
 }
 
-export function deleteLocalBackup(filePath: string): void {
+export function listLocalBackups(profileId: string): LocalFile[] {
+  return listDir(join(DIRS.backups, profileId), ['.sql.gz', '.sql', '.gz']);
+}
+
+export function listLocalLogs(profileId: string): LocalFile[] {
+  return listDir(join(DIRS.logs, profileId), ['.log', '.log.gz']);
+}
+
+export function listLocalFiles(profileId: string): LocalFile[] {
+  return listDir(join(DIRS.files, profileId));
+}
+
+export function deleteLocalFile(filePath: string): void {
   if (existsSync(filePath)) unlinkSync(filePath);
+}
+
+// ── Sanitize a remote path to a safe local filename ──────────────────────────
+
+export function remotePathToFileName(remotePath: string): string {
+  // e.g. /etc/nginx/nginx.conf → etc_nginx_nginx.conf
+  return remotePath.replace(/^\//, '').replace(/\//g, '_');
 }

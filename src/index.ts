@@ -7,7 +7,9 @@ import { getProfiles, saveProfile, deleteProfile, getGroups, touchProfile, store
 import { connect, copySSHKey, buildSSHCommand, testConnection, getConnectMethods } from './lib/ssh.js';
 import { parseSSHConfig, sshConfigExists, sshConfigPath } from './lib/sshconfig.js';
 import { runCommand, captureCommand, backupPostgres, backupMySQL, GLOBAL_SNIPPETS, getServiceSnippets } from './lib/runner.js';
-import { ensureStorageDirs, getBackupDir, listLocalBackups, deleteLocalBackup, timestamp, formatSize, formatDate } from './lib/storage.js';
+import { ensureStorageDirs, getBackupDir, getLogDir, getFilesDir, listLocalBackups, listLocalLogs, listLocalFiles, deleteLocalFile, timestamp, formatSize, formatDate, remotePathToFileName, type LocalFile } from './lib/storage.js';
+import { getSystemLogSources, getServiceLogSources } from './lib/logger.js';
+import { getServiceActions, buildCreateDatabase, buildDropDatabase, buildCreateUser, buildGrantPrivileges, buildListUsers, buildChangePassword, SAFE_DB_NAME, SAFE_DB_USER } from './lib/servicecontrol.js';
 import type { Profile, Tunnel, ConnectMethod, ServiceConfig, CommandSnippet } from './lib/types.js';
 import { SERVICE_DEFAULT_PORTS } from './lib/types.js';
 
@@ -165,23 +167,27 @@ async function menuProfileActions(id: string): Promise<void> {
   printProfileDetail(profile);
   console.log();
 
-  const hasDB = profile.services.some(s => ['postgres','mysql'].includes(s.type));
+  const hasDB      = profile.services.some(s => ['postgres','mysql'].includes(s.type));
+  const hasService = profile.services.length > 0;
 
   const { action } = await inquirer.prompt<{ action: string }>([{
     type: 'list',
     name: 'action',
     message: 'Actions',
     choices: [
-      { name: `${c.warning('⚡')} Connect`,                       value: 'connect' },
-      { name: `${c.primary('🚀')} Quick commands`,                value: 'commands' },
-      ...(hasDB ? [{ name: `${c.secondary('🗄')}  Database operations`, value: 'database' }] : []),
+      { name: `${c.warning('⚡')} Connect`,                             value: 'connect' },
+      { name: `${c.primary('🚀')} Quick commands`,                      value: 'commands' },
+      ...(hasDB      ? [{ name: `${c.secondary('🗄')}  Database operations`, value: 'database' }] : []),
+      ...(hasService ? [{ name: `${c.warning('🔧')} Service control`,        value: 'services' }] : []),
+      { name: `${c.primary('📋')} Pull logs`,                           value: 'logs' },
+      { name: `${c.primary('📁')} Pull files`,                          value: 'files' },
       new inquirer.Separator(),
-      { name: `${c.primary('✏')}  Edit profile`,                  value: 'edit' },
-      { name: `${c.success('🔑')} Copy SSH key`,                  value: 'copykey' },
-      { name: `${c.primary('📡')} Test connection`,               value: 'test' },
-      { name: `${c.error('✗')}  Delete profile`,                  value: 'delete' },
+      { name: `${c.primary('✏')}  Edit profile`,                        value: 'edit' },
+      { name: `${c.success('🔑')} Copy SSH key`,                        value: 'copykey' },
+      { name: `${c.primary('📡')} Test connection`,                     value: 'test' },
+      { name: `${c.error('✗')}  Delete profile`,                        value: 'delete' },
       new inquirer.Separator(),
-      { name: c.muted('← Back'),                                   value: 'back' },
+      { name: c.muted('← Back'),                                         value: 'back' },
     ],
   }]);
 
@@ -191,6 +197,9 @@ async function menuProfileActions(id: string): Promise<void> {
   if (action === 'copykey')  { await menuCopyKey(profile); return; }
   if (action === 'commands') { await menuQuickCommands(profile); return; }
   if (action === 'database') { await menuDatabase(profile); return; }
+  if (action === 'services') { await menuServiceControl(profile); return; }
+  if (action === 'logs')     { await menuPullLogs(profile); return; }
+  if (action === 'files')    { await menuPullFiles(profile); return; }
 
   if (action === 'connect') {
     const method = await pickConnectMethod(profile);
@@ -823,7 +832,9 @@ async function menuDatabase(profile: Profile): Promise<void> {
         { name: `${c.primary('📋')} List databases`,      value: 'listdbs' },
         { name: `${c.primary('📋')} List tables`,         value: 'listtables' },
         { name: `${c.primary('📊')} Database size`,       value: 'size' },
-        { name: `${c.warning('📡')} Active connections`,  value: 'connections' },
+        { name: `${c.warning('📡')} Active connections`,        value: 'connections' },
+        new inquirer.Separator(),
+        { name: `${c.secondary('👤')} Manage users & databases`, value: 'manage' },
         ...(backups.length > 0 ? [
           new inquirer.Separator(),
           { name: `${c.secondary('🕐')} Backup history (${backups.length} backups)`, value: 'history' },
@@ -844,6 +855,11 @@ async function menuDatabase(profile: Profile): Promise<void> {
 
     if (action === 'history') {
       await menuBackupHistory(profile, service);
+      continue;
+    }
+
+    if (action === 'manage') {
+      await menuDBManagement(profile, service, method);
       continue;
     }
 
@@ -961,8 +977,514 @@ async function menuBackupHistory(profile: Profile, service: ServiceConfig): Prom
         default: false,
       }]);
       if (yes) {
-        deleteLocalBackup(choice);
+        deleteLocalFile(choice);
         msg('Backup deleted.', 'success');
+        await pause();
+        return;
+      }
+    }
+  }
+}
+
+// ─── DB Management (users & databases) ───────────────────────────────────────
+
+async function menuDBManagement(profile: Profile, service: ServiceConfig, method: ConnectMethod): Promise<void> {
+  while (true) {
+    banner();
+    console.log(c.primary.bold(`  DB Management — ${profile.name} / ${service.name}\n`));
+
+    const { action } = await inquirer.prompt<{ action: string }>([{
+      type: 'list', name: 'action',
+      message: 'What do you want to do?',
+      choices: [
+        { name: `${c.primary('👥')} List users`,       value: 'listusers' },
+        { name: `${c.success('+')} Create database`,   value: 'createdb' },
+        { name: `${c.error('✗')}  Drop database`,      value: 'dropdb' },
+        { name: `${c.success('+')} Create user`,       value: 'createuser' },
+        { name: `${c.primary('🔐')} Grant privileges`, value: 'grant' },
+        { name: `${c.warning('🔑')} Change password`,  value: 'chpasswd' },
+        new inquirer.Separator(),
+        { name: c.muted('← Back'),                     value: 'back' },
+      ],
+    }]);
+
+    if (action === 'back') return;
+
+    if (action === 'listusers') {
+      banner();
+      runCommand(profile, method, buildListUsers(service));
+      console.log();
+      await pause();
+      continue;
+    }
+
+    if (action === 'createdb') {
+      const { dbName } = await inquirer.prompt<{ dbName: string }>([{
+        type: 'input', name: 'dbName',
+        message: 'New database name:',
+        validate: (v: string) => SAFE_DB_NAME.test(v) ? true : 'Alphanumeric and underscores only, must start with a letter',
+      }]);
+      const { confirm } = await inquirer.prompt<{ confirm: boolean }>([{
+        type: 'confirm', name: 'confirm',
+        message: `Create database ${c.warning(dbName)}?`,
+        default: true,
+      }]);
+      if (confirm) {
+        banner();
+        const code = runCommand(profile, method, buildCreateDatabase(service, dbName));
+        code === 0 ? msg(`Database "${dbName}" created!`, 'success') : msg('Failed to create database.', 'error');
+        await pause();
+      }
+      continue;
+    }
+
+    if (action === 'dropdb') {
+      const { dbName } = await inquirer.prompt<{ dbName: string }>([{
+        type: 'input', name: 'dbName',
+        message: c.error('Database name to DROP (IRREVERSIBLE):'),
+        validate: (v: string) => SAFE_DB_NAME.test(v) ? true : 'Alphanumeric and underscores only',
+      }]);
+      const { confirm } = await inquirer.prompt<{ confirm: boolean }>([{
+        type: 'confirm', name: 'confirm',
+        message: c.error(`PERMANENTLY DROP database "${dbName}"? All data will be lost.`),
+        default: false,
+      }]);
+      if (confirm) {
+        banner();
+        const code = runCommand(profile, method, buildDropDatabase(service, dbName));
+        code === 0 ? msg(`Database "${dbName}" dropped.`, 'success') : msg('Failed to drop database.', 'error');
+        await pause();
+      }
+      continue;
+    }
+
+    if (action === 'createuser') {
+      const fields = await inquirer.prompt<{ userName: string; password: string; confirmPwd: string }>([
+        { type: 'input',    name: 'userName',   message: 'New username:',        validate: (v: string) => SAFE_DB_USER.test(v) ? true : 'Alphanumeric and underscores only' },
+        { type: 'password', name: 'password',   message: 'Password:',            validate: (v: string) => v.length >= 8 ? true : 'Minimum 8 characters' },
+        { type: 'password', name: 'confirmPwd', message: 'Confirm password:' },
+      ]);
+      if (fields.password !== fields.confirmPwd) {
+        msg('Passwords do not match.', 'error');
+        await pause();
+        continue;
+      }
+      banner();
+      const code = runCommand(profile, method, buildCreateUser(service, fields.userName, fields.password));
+      code === 0 ? msg(`User "${fields.userName}" created!`, 'success') : msg('Failed to create user.', 'error');
+      await pause();
+      continue;
+    }
+
+    if (action === 'grant') {
+      const fields = await inquirer.prompt<{ userName: string; dbName: string }>([
+        { type: 'input', name: 'userName', message: 'Username to grant:', validate: (v: string) => SAFE_DB_USER.test(v) ? true : 'Invalid' },
+        { type: 'input', name: 'dbName',   message: 'Database name:',    validate: (v: string) => SAFE_DB_NAME.test(v) ? true : 'Invalid' },
+      ]);
+      const { confirm } = await inquirer.prompt<{ confirm: boolean }>([{
+        type: 'confirm', name: 'confirm',
+        message: `Grant ALL privileges on ${c.warning(fields.dbName)} to ${c.warning(fields.userName)}?`,
+        default: true,
+      }]);
+      if (confirm) {
+        banner();
+        const code = runCommand(profile, method, buildGrantPrivileges(service, fields.userName, fields.dbName));
+        code === 0 ? msg('Privileges granted!', 'success') : msg('Failed to grant privileges.', 'error');
+        await pause();
+      }
+      continue;
+    }
+
+    if (action === 'chpasswd') {
+      const fields = await inquirer.prompt<{ userName: string; password: string; confirmPwd: string }>([
+        { type: 'input',    name: 'userName',   message: 'Username:', validate: (v: string) => SAFE_DB_USER.test(v) ? true : 'Invalid' },
+        { type: 'password', name: 'password',   message: 'New password:', validate: (v: string) => v.length >= 8 ? true : 'Minimum 8 characters' },
+        { type: 'password', name: 'confirmPwd', message: 'Confirm password:' },
+      ]);
+      if (fields.password !== fields.confirmPwd) {
+        msg('Passwords do not match.', 'error');
+        await pause();
+        continue;
+      }
+      banner();
+      const code = runCommand(profile, method, buildChangePassword(service, fields.userName, fields.password));
+      code === 0 ? msg('Password changed!', 'success') : msg('Failed to change password.', 'error');
+      await pause();
+    }
+  }
+}
+
+// ─── Service Control menu ─────────────────────────────────────────────────────
+
+async function menuServiceControl(profile: Profile): Promise<void> {
+  // Pick a service if multiple
+  let service = profile.services[0]!;
+  if (profile.services.length > 1) {
+    const { svcId } = await inquirer.prompt<{ svcId: string }>([{
+      type: 'list', name: 'svcId',
+      message: 'Which service?',
+      choices: profile.services.map(s => ({
+        name: `${c.warning(s.type.padEnd(12))} ${s.name}`,
+        value: s.id,
+      })),
+    }]);
+    service = profile.services.find(s => s.id === svcId)!;
+  }
+
+  while (true) {
+    banner();
+    console.log(c.primary.bold(`  Service Control — ${profile.name} / ${service.name}`));
+    console.log(c.muted(`  Type: ${service.type}\n`));
+
+    const actions = getServiceActions(service);
+    const method  = await pickConnectMethod(profile);
+
+    const { choice } = await inquirer.prompt<{ choice: string }>([{
+      type: 'list', name: 'choice',
+      message: 'Select action:',
+      choices: [
+        ...actions.map(a => ({
+          name: a.dangerous
+            ? c.error(`⚠  ${a.label}`)
+            : c.text(a.label),
+          value: a.label,
+        })),
+        new inquirer.Separator(),
+        { name: c.muted('← Back'), value: '__back__' },
+      ],
+      pageSize: 20,
+    }]);
+
+    if (choice === '__back__') return;
+
+    const actionDef = actions.find(a => a.label === choice)!;
+
+    if (actionDef.dangerous) {
+      const { yes } = await inquirer.prompt<{ yes: boolean }>([{
+        type: 'confirm', name: 'yes',
+        message: c.error(`⚠  "${choice}" is a destructive action. Continue?`),
+        default: false,
+      }]);
+      if (!yes) continue;
+    }
+
+    banner();
+    console.log(c.primary.bold(`  Running: `) + c.muted(actionDef.command));
+    console.log();
+    runCommand(profile, method, actionDef.command);
+    console.log();
+    await pause();
+  }
+}
+
+// ─── Pull Logs menu ───────────────────────────────────────────────────────────
+
+async function menuPullLogs(profile: Profile): Promise<void> {
+  while (true) {
+    banner();
+    console.log(c.primary.bold(`  Pull Logs — ${profile.name}\n`));
+
+    const systemSources = getSystemLogSources();
+    const serviceSources = profile.services.flatMap(s => getServiceLogSources(s));
+
+    const existingLogs = listLocalLogs(profile.id);
+
+    const { choice } = await inquirer.prompt<{ choice: string }>([{
+      type: 'list', name: 'choice',
+      message: 'Select log to pull:',
+      choices: [
+        new inquirer.Separator('── System ──'),
+        ...systemSources.map(s => ({ name: c.text(s.label), value: `source:${s.label}` })),
+        ...(serviceSources.length > 0 ? [
+          new inquirer.Separator('── Services ──'),
+          ...serviceSources.map(s => ({ name: `${c.warning(s.serviceType ?? '')}  ${c.text(s.label)}`, value: `source:${s.label}` })),
+        ] : []),
+        new inquirer.Separator('── Custom ──'),
+        { name: `${c.primary('+')} Custom log path...`, value: '__custom__' },
+        ...(existingLogs.length > 0 ? [
+          new inquirer.Separator('── Pulled logs ──'),
+          { name: `${c.secondary('🕐')} View pulled log history (${existingLogs.length})`, value: '__history__' },
+        ] : []),
+        new inquirer.Separator(),
+        { name: c.muted('← Back'), value: '__back__' },
+      ],
+      pageSize: 25,
+    }]);
+
+    if (choice === '__back__') return;
+
+    if (choice === '__history__') {
+      await menuLogHistory(profile);
+      continue;
+    }
+
+    let command = '';
+    let fileName = '';
+
+    if (choice === '__custom__') {
+      const { remotePath } = await inquirer.prompt<{ remotePath: string }>([{
+        type: 'input', name: 'remotePath',
+        message: 'Remote file path (e.g. /var/log/myapp/app.log):',
+        validate: (v: string) => v.trim().startsWith('/') ? true : 'Must be an absolute path',
+      }]);
+      const { lines } = await inquirer.prompt<{ lines: number }>([{
+        type: 'number', name: 'lines',
+        message: 'How many lines to pull?',
+        default: 500,
+      }]);
+      command  = `sudo tail -n ${lines} ${remotePath} 2>/dev/null`;
+      fileName = remotePathToFileName(remotePath) + '.log';
+    } else {
+      const label  = choice.slice(7); // strip 'source:'
+      const source = [...systemSources, ...serviceSources].find(s => s.label === label);
+      if (!source) continue;
+      command  = source.command;
+      fileName = source.fileName;
+    }
+
+    const method   = await pickConnectMethod(profile);
+    const ts       = timestamp();
+    const logDir   = getLogDir(profile.id);
+    const filePath = `${logDir}/${ts}_${fileName}`;
+
+    banner();
+    console.log(c.primary.bold('  Pulling log to: ') + c.muted(filePath));
+    console.log(c.muted('  Please wait...\n'));
+
+    const { streamToFile } = await import('./lib/runner.js');
+    const result = streamToFile(profile, method, command, filePath);
+
+    if (result.success) {
+      msg(`Log saved! Size: ${formatSize(result.fileSizeBytes)}`, 'success');
+      console.log(c.muted(`  Path: ${filePath}`));
+      console.log(c.muted(`  View: less "${filePath}"`));
+    } else {
+      msg(`Failed to pull log: ${result.error}`, 'error');
+    }
+    await pause();
+  }
+}
+
+async function menuLogHistory(profile: Profile): Promise<void> {
+  while (true) {
+    banner();
+    console.log(c.primary.bold(`  Log History — ${profile.name}\n`));
+
+    const logs = listLocalLogs(profile.id);
+    if (logs.length === 0) {
+      msg('No pulled logs found.', 'info');
+      await pause();
+      return;
+    }
+
+    const { filePath } = await inquirer.prompt<{ filePath: string }>([{
+      type: 'list', name: 'filePath',
+      message: 'Select log file:',
+      choices: [
+        ...logs.map(l => ({
+          name: [
+            c.text(l.mtime.toLocaleString().padEnd(22)),
+            c.primary(formatSize(l.fileSizeBytes).padEnd(10)),
+            c.muted(l.fileName),
+          ].join('  '),
+          value: l.filePath,
+        })),
+        new inquirer.Separator(),
+        { name: c.muted('← Back'), value: '__back__' },
+      ],
+      pageSize: 15,
+    }]);
+
+    if (filePath === '__back__') return;
+
+    const { action } = await inquirer.prompt<{ action: string }>([{
+      type: 'list', name: 'action',
+      message: 'Action:',
+      choices: [
+        { name: `${c.primary('👁')}  View (less)`,    value: 'view' },
+        { name: `${c.primary('📂')} Show path`,       value: 'path' },
+        { name: `${c.error('✗')}  Delete`,            value: 'delete' },
+        { name: c.muted('← Back'),                    value: 'back' },
+      ],
+    }]);
+
+    if (action === 'back') continue;
+
+    if (action === 'path') {
+      console.log(c.muted('\n  Path: ') + c.text(filePath));
+      await pause();
+    }
+
+    if (action === 'view') {
+      const { spawnSync } = await import('child_process');
+      spawnSync('less', [filePath], { stdio: 'inherit' });
+    }
+
+    if (action === 'delete') {
+      const { yes } = await inquirer.prompt<{ yes: boolean }>([{
+        type: 'confirm', name: 'yes',
+        message: c.error('Delete this log file?'),
+        default: false,
+      }]);
+      if (yes) {
+        deleteLocalFile(filePath);
+        msg('Log deleted.', 'success');
+        await pause();
+        return;
+      }
+    }
+  }
+}
+
+// ─── Pull Files menu ──────────────────────────────────────────────────────────
+
+async function menuPullFiles(profile: Profile): Promise<void> {
+  // Common config/interesting files for quick access
+  const QUICK_PATHS = [
+    { label: 'postgresql.conf',   path: '/etc/postgresql/*/main/postgresql.conf' },
+    { label: 'pg_hba.conf',       path: '/etc/postgresql/*/main/pg_hba.conf' },
+    { label: 'pgbouncer.ini',     path: '/etc/pgbouncer/pgbouncer.ini' },
+    { label: 'nginx.conf',        path: '/etc/nginx/nginx.conf' },
+    { label: '/etc/hosts',        path: '/etc/hosts' },
+    { label: '.env (app root)',   path: '/var/www/html/.env' },
+    { label: 'docker-compose.yml',path: '/opt/app/docker-compose.yml' },
+    { label: 'crontab',           path: '/etc/crontab' },
+    { label: '/etc/environment',  path: '/etc/environment' },
+  ];
+
+  while (true) {
+    banner();
+    console.log(c.primary.bold(`  Pull Files — ${profile.name}\n`));
+
+    const existingFiles = listLocalFiles(profile.id);
+
+    const { choice } = await inquirer.prompt<{ choice: string }>([{
+      type: 'list', name: 'choice',
+      message: 'Select file to pull:',
+      choices: [
+        new inquirer.Separator('── Common config files ──'),
+        ...QUICK_PATHS.map(q => ({ name: c.text(q.label), value: `quick:${q.path}` })),
+        new inquirer.Separator('── Custom ──'),
+        { name: `${c.primary('+')} Enter custom path...`, value: '__custom__' },
+        ...(existingFiles.length > 0 ? [
+          new inquirer.Separator('── Previously pulled ──'),
+          { name: `${c.secondary('🕐')} View pulled files (${existingFiles.length})`, value: '__history__' },
+        ] : []),
+        new inquirer.Separator(),
+        { name: c.muted('← Back'), value: '__back__' },
+      ],
+      pageSize: 20,
+    }]);
+
+    if (choice === '__back__') return;
+
+    if (choice === '__history__') {
+      await menuFileHistory(profile);
+      continue;
+    }
+
+    let remotePath = '';
+
+    if (choice === '__custom__') {
+      const { p } = await inquirer.prompt<{ p: string }>([{
+        type: 'input', name: 'p',
+        message: 'Remote file path:',
+        validate: (v: string) => v.trim().startsWith('/') ? true : 'Must be an absolute path',
+      }]);
+      remotePath = p;
+    } else {
+      remotePath = choice.slice(6); // strip 'quick:'
+    }
+
+    const method   = await pickConnectMethod(profile);
+    const ts       = timestamp();
+    const filesDir = getFilesDir(profile.id);
+    const fileName = `${ts}_${remotePathToFileName(remotePath)}`;
+    const filePath = `${filesDir}/${fileName}`;
+
+    banner();
+    console.log(c.primary.bold('  Pulling: ') + c.muted(remotePath));
+    console.log(c.muted('  Saving to: ') + c.muted(filePath));
+    console.log();
+
+    const command = `sudo cat ${remotePath} 2>/dev/null`;
+    const { streamToFile } = await import('./lib/runner.js');
+    const result = streamToFile(profile, method, command, filePath);
+
+    if (result.success) {
+      msg(`File saved! Size: ${formatSize(result.fileSizeBytes)}`, 'success');
+      console.log(c.muted(`  View: less "${filePath}"`));
+    } else {
+      msg(`Failed to pull file: ${result.error}`, 'error');
+    }
+    await pause();
+  }
+}
+
+async function menuFileHistory(profile: Profile): Promise<void> {
+  while (true) {
+    banner();
+    console.log(c.primary.bold(`  Pulled Files — ${profile.name}\n`));
+
+    const files = listLocalFiles(profile.id);
+    if (files.length === 0) {
+      msg('No pulled files.', 'info');
+      await pause();
+      return;
+    }
+
+    const { filePath } = await inquirer.prompt<{ filePath: string }>([{
+      type: 'list', name: 'filePath',
+      message: 'Select file:',
+      choices: [
+        ...files.map(f => ({
+          name: [
+            c.text(f.mtime.toLocaleString().padEnd(22)),
+            c.primary(formatSize(f.fileSizeBytes).padEnd(10)),
+            c.muted(f.fileName),
+          ].join('  '),
+          value: f.filePath,
+        })),
+        new inquirer.Separator(),
+        { name: c.muted('← Back'), value: '__back__' },
+      ],
+      pageSize: 15,
+    }]);
+
+    if (filePath === '__back__') return;
+
+    const { action } = await inquirer.prompt<{ action: string }>([{
+      type: 'list', name: 'action',
+      message: 'Action:',
+      choices: [
+        { name: `${c.primary('👁')}  View (less)`,    value: 'view' },
+        { name: `${c.primary('📂')} Show path`,       value: 'path' },
+        { name: `${c.error('✗')}  Delete`,            value: 'delete' },
+        { name: c.muted('← Back'),                    value: 'back' },
+      ],
+    }]);
+
+    if (action === 'back') continue;
+
+    if (action === 'path') {
+      console.log(c.muted('\n  Path: ') + c.text(filePath));
+      await pause();
+    }
+
+    if (action === 'view') {
+      const { spawnSync } = await import('child_process');
+      spawnSync('less', [filePath], { stdio: 'inherit' });
+    }
+
+    if (action === 'delete') {
+      const { yes } = await inquirer.prompt<{ yes: boolean }>([{
+        type: 'confirm', name: 'yes',
+        message: c.error('Delete this file?'),
+        default: false,
+      }]);
+      if (yes) {
+        deleteLocalFile(filePath);
+        msg('File deleted.', 'success');
         await pause();
         return;
       }
