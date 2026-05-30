@@ -93,56 +93,49 @@ export function getServiceActions(service: ServiceConfig): ServiceAction[] {
 export const SAFE_DB_NAME   = /^[a-zA-Z_][a-zA-Z0-9_]{0,62}$/;
 export const SAFE_DB_USER   = /^[a-zA-Z_][a-zA-Z0-9_]{0,62}$/;
 
+// Always use -h 127.0.0.1 to force TCP connection.
+// Without it psql connects via Unix socket which triggers peer auth
+// (requires OS user = DB user). TCP uses md5/password auth instead.
+function pgArgs(service: ServiceConfig): string {
+  const u = service.dbUser ?? 'postgres';
+  const p = service.dbPort ? `-p ${service.dbPort}` : '';
+  return `-U ${u} -h 127.0.0.1 ${p}`.trim();
+}
+
 export function buildCreateDatabase(service: ServiceConfig, dbName: string): string {
-  if (service.type === 'postgres') {
-    const u = service.dbUser ?? 'postgres';
-    const p = service.dbPort ? `-p ${service.dbPort}` : '';
-    return `psql -U ${u} ${p} -c "CREATE DATABASE \\"${dbName}\\""`;
-  }
-  return `mysql -u ${service.dbUser ?? 'root'} -e "CREATE DATABASE \`${dbName}\`;"`;
+  if (service.type === 'postgres')
+    return `psql ${pgArgs(service)} -c "CREATE DATABASE \\"${dbName}\\""`;
+  return `mysql -u ${service.dbUser ?? 'root'} -h 127.0.0.1 -e "CREATE DATABASE \`${dbName}\`;"`;
 }
 
 export function buildDropDatabase(service: ServiceConfig, dbName: string): string {
-  if (service.type === 'postgres') {
-    const u = service.dbUser ?? 'postgres';
-    const p = service.dbPort ? `-p ${service.dbPort}` : '';
-    return `psql -U ${u} ${p} -c "DROP DATABASE \\"${dbName}\\""`;
-  }
-  return `mysql -u ${service.dbUser ?? 'root'} -e "DROP DATABASE \`${dbName}\`;"`;
+  if (service.type === 'postgres')
+    return `psql ${pgArgs(service)} -c "DROP DATABASE \\"${dbName}\\""`;
+  return `mysql -u ${service.dbUser ?? 'root'} -h 127.0.0.1 -e "DROP DATABASE \`${dbName}\`;"`;
 }
 
 export function buildCreateUser(service: ServiceConfig, userName: string, password: string): string {
-  if (service.type === 'postgres') {
-    const u = service.dbUser ?? 'postgres';
-    const p = service.dbPort ? `-p ${service.dbPort}` : '';
-    return `psql -U ${u} ${p} -c "CREATE USER \\"${userName}\\" WITH PASSWORD '${password.replace(/'/g, "\\'")}'"`;
-  }
-  return `mysql -u ${service.dbUser ?? 'root'} -e "CREATE USER '${userName}'@'%' IDENTIFIED BY '${password.replace(/'/g, "\\'")}';"`;
+  const pwd = password.replace(/'/g, "\\'");
+  if (service.type === 'postgres')
+    return `psql ${pgArgs(service)} -c "CREATE USER \\"${userName}\\" WITH PASSWORD '${pwd}'"`;
+  return `mysql -u ${service.dbUser ?? 'root'} -h 127.0.0.1 -e "CREATE USER '${userName}'@'%' IDENTIFIED BY '${pwd}';"`;
 }
 
 export function buildGrantPrivileges(service: ServiceConfig, userName: string, dbName: string): string {
-  if (service.type === 'postgres') {
-    const u = service.dbUser ?? 'postgres';
-    const p = service.dbPort ? `-p ${service.dbPort}` : '';
-    return `psql -U ${u} ${p} -c "GRANT ALL PRIVILEGES ON DATABASE \\"${dbName}\\" TO \\"${userName}\\""`;
-  }
-  return `mysql -u ${service.dbUser ?? 'root'} -e "GRANT ALL PRIVILEGES ON \`${dbName}\`.* TO '${userName}'@'%'; FLUSH PRIVILEGES;"`;
+  if (service.type === 'postgres')
+    return `psql ${pgArgs(service)} -c "GRANT ALL PRIVILEGES ON DATABASE \\"${dbName}\\" TO \\"${userName}\\""`;
+  return `mysql -u ${service.dbUser ?? 'root'} -h 127.0.0.1 -e "GRANT ALL PRIVILEGES ON \`${dbName}\`.* TO '${userName}'@'%'; FLUSH PRIVILEGES;"`;
 }
 
 export function buildListUsers(service: ServiceConfig): string {
-  if (service.type === 'postgres') {
-    const u = service.dbUser ?? 'postgres';
-    const p = service.dbPort ? `-p ${service.dbPort}` : '';
-    return `psql -U ${u} ${p} -c "\\du"`;
-  }
-  return `mysql -u ${service.dbUser ?? 'root'} -e "SELECT User, Host, plugin FROM mysql.user;"`;
+  if (service.type === 'postgres')
+    return `psql ${pgArgs(service)} -c "\\du"`;
+  return `mysql -u ${service.dbUser ?? 'root'} -h 127.0.0.1 -e "SELECT User, Host, plugin FROM mysql.user;"`;
 }
 
 export function buildChangePassword(service: ServiceConfig, userName: string, password: string): string {
-  if (service.type === 'postgres') {
-    const u = service.dbUser ?? 'postgres';
-    const p = service.dbPort ? `-p ${service.dbPort}` : '';
-    return `psql -U ${u} ${p} -c "ALTER USER \\"${userName}\\" WITH PASSWORD '${password.replace(/'/g, "\\'")}';"`;
-  }
-  return `mysql -u ${service.dbUser ?? 'root'} -e "ALTER USER '${userName}'@'%' IDENTIFIED BY '${password.replace(/'/g, "\\'")}'; FLUSH PRIVILEGES;"`;
+  const pwd = password.replace(/'/g, "\\'");
+  if (service.type === 'postgres')
+    return `psql ${pgArgs(service)} -c "ALTER USER \\"${userName}\\" WITH PASSWORD '${pwd}';"`;
+  return `mysql -u ${service.dbUser ?? 'root'} -h 127.0.0.1 -e "ALTER USER '${userName}'@'%' IDENTIFIED BY '${pwd}'; FLUSH PRIVILEGES;"`;
 }

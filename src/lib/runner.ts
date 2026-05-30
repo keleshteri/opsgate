@@ -82,8 +82,8 @@ export function backupPostgres(
   const user = service.dbUser ?? profile.user;
   const db   = service.dbName ?? 'postgres';
 
-  // pg_dump streams to stdout, gzip compresses, SSH sends to local
-  const cmd = `pg_dump -U ${user} -p ${port} -d ${db} --no-password | gzip`;
+  // -h 127.0.0.1 forces TCP connection (avoids peer auth on Unix socket)
+  const cmd = `pg_dump -U ${user} -h 127.0.0.1 -p ${port} -d ${db} --no-password | gzip`;
   return streamToFile(profile, method, cmd, localPath);
 }
 
@@ -146,15 +146,20 @@ export function getServiceSnippets(service: ServiceConfig): { name: string; comm
   const db   = service.dbName;
 
   switch (service.type) {
-    case 'postgres':
+    case 'postgres': {
+      // Always use -h 127.0.0.1 to force TCP (avoids peer auth on Unix socket)
+      const u = user ?? 'postgres';
+      const h = '-h 127.0.0.1';
+      const p = port ? `-p ${port}` : '';
       return [
-        { name: 'PostgreSQL status',     command: 'sudo systemctl status postgresql' },
-        { name: 'List databases',        command: `psql -U ${user ?? 'postgres'} ${port ? `-p ${port}` : ''} -c "\\l"` },
-        { name: 'List connections',      command: `psql -U ${user ?? 'postgres'} ${port ? `-p ${port}` : ''} -c "SELECT pid,usename,application_name,client_addr,state FROM pg_stat_activity;"` },
-        { name: 'Database size',         command: `psql -U ${user ?? 'postgres'} ${port ? `-p ${port}` : ''} -c "SELECT pg_database.datname, pg_size_pretty(pg_database_size(pg_database.datname)) FROM pg_database ORDER BY pg_database_size(pg_database.datname) DESC;"` },
-        { name: 'Slow queries',          command: `psql -U ${user ?? 'postgres'} ${db ? `-d ${db}` : ''} ${port ? `-p ${port}` : ''} -c "SELECT pid, now()-query_start AS duration, query, state FROM pg_stat_activity WHERE state != 'idle' ORDER BY duration DESC LIMIT 10;"` },
-        { name: 'PostgreSQL logs',       command: 'sudo tail -n 100 /var/log/postgresql/*.log 2>/dev/null || sudo journalctl -u postgresql -n 100 --no-pager' },
+        { name: 'PostgreSQL status',  command: 'sudo systemctl status postgresql --no-pager' },
+        { name: 'List databases',     command: `psql -U ${u} ${h} ${p} -c "\\l"` },
+        { name: 'List connections',   command: `psql -U ${u} ${h} ${p} -c "SELECT pid,usename,application_name,client_addr,state FROM pg_stat_activity;"` },
+        { name: 'Database size',      command: `psql -U ${u} ${h} ${p} -c "SELECT datname, pg_size_pretty(pg_database_size(datname)) AS size FROM pg_database ORDER BY pg_database_size(datname) DESC;"` },
+        { name: 'Slow queries',       command: `psql -U ${u} ${h} ${p} ${db ? `-d ${db}` : ''} -c "SELECT pid, now()-query_start AS duration, query, state FROM pg_stat_activity WHERE state != 'idle' ORDER BY duration DESC LIMIT 10;"` },
+        { name: 'PostgreSQL logs',    command: 'sudo tail -n 100 /var/log/postgresql/*.log 2>/dev/null || sudo journalctl -u postgresql -n 100 --no-pager' },
       ];
+    }
 
     case 'mysql':
       return [
