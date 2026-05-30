@@ -29,7 +29,7 @@ export function banner(): void {
   console.clear();
   console.log(c.primary.bold('╔══════════════════════════════════════════╗'));
   console.log(c.primary.bold('║') + c.secondary.bold('         ⚡  OpsGate — SSH Manager         ') + c.primary.bold('║'));
-  console.log(c.primary.bold('║') + c.muted('       Smart DevOps SSH Gateway  v1.0     ') + c.primary.bold('║'));
+  console.log(c.primary.bold('║') + c.muted('       Smart DevOps SSH Gateway  v1.1     ') + c.primary.bold('║'));
   console.log(c.primary.bold('╚══════════════════════════════════════════╝'));
   console.log();
 }
