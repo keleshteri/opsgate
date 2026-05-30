@@ -1,4 +1,4 @@
-import { execFileSync, spawn } from 'child_process';
+import { execFileSync, spawnSync, spawn } from 'child_process';
 import type { Profile, ConnectMethod, ConnectMethodOption } from './types.js';
 
 // ── Input validation ──────────────────────────────────────────────────────────
@@ -128,8 +128,11 @@ export function buildSSHCommand(profile: Profile, method: ConnectMethod = 'publi
 
 export function connect(profile: Profile, method: ConnectMethod = 'public'): void {
   const args = buildSSHArgs(profile, method);
-  const child = spawn('ssh', args, { stdio: 'inherit', shell: false });
-  child.on('exit', (code: number | null) => process.exit(code ?? 0));
+  // spawnSync blocks the Node.js process entirely while SSH runs.
+  // This prevents the main menu loop from continuing and calling
+  // console.clear() which would corrupt the SSH terminal session.
+  const result = spawnSync('ssh', args, { stdio: 'inherit', shell: false });
+  process.exit(result.status ?? 0);
 }
 
 export function copySSHKey(
