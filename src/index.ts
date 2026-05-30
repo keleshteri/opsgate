@@ -3,10 +3,15 @@ import inquirer from 'inquirer';
 import { nanoid } from 'nanoid';
 import Fuse from 'fuse.js';
 import { c, banner, msg, profileSummary, groupColor } from './lib/ui.js';
-import { getProfiles, saveProfile, deleteProfile, getGroups, touchProfile, storePath } from './lib/store.js';
+import { getProfiles, saveProfile, deleteProfile, getGroups, touchProfile, storePath, saveBackupRecord, getBackups, deleteBackupRecord, getGlobalSnippets, saveGlobalSnippet, deleteGlobalSnippet } from './lib/store.js';
 import { connect, copySSHKey, buildSSHCommand, testConnection, getConnectMethods } from './lib/ssh.js';
 import { parseSSHConfig, sshConfigExists, sshConfigPath } from './lib/sshconfig.js';
-import type { Profile, Tunnel, ConnectMethod } from './lib/types.js';
+import { runCommand, captureCommand, backupPostgres, backupMySQL, GLOBAL_SNIPPETS, getServiceSnippets } from './lib/runner.js';
+import { ensureStorageDirs, getBackupDir, listLocalBackups, deleteLocalBackup, timestamp, formatSize, formatDate } from './lib/storage.js';
+import type { Profile, Tunnel, ConnectMethod, ServiceConfig, CommandSnippet } from './lib/types.js';
+import { SERVICE_DEFAULT_PORTS } from './lib/types.js';
+
+ensureStorageDirs();
 
 // ─── Main loop ───────────────────────────────────────────────────────────────
 
@@ -160,25 +165,32 @@ async function menuProfileActions(id: string): Promise<void> {
   printProfileDetail(profile);
   console.log();
 
+  const hasDB = profile.services.some(s => ['postgres','mysql'].includes(s.type));
+
   const { action } = await inquirer.prompt<{ action: string }>([{
     type: 'list',
     name: 'action',
     message: 'Actions',
     choices: [
-      { name: `${c.warning('⚡')} Connect`,         value: 'connect' },
-      { name: `${c.primary('✏')}  Edit profile`,    value: 'edit' },
-      { name: `${c.success('🔑')} Copy SSH key`,    value: 'copykey' },
-      { name: `${c.primary('📡')} Test connection`, value: 'test' },
-      { name: `${c.error('✗')}  Delete profile`,    value: 'delete' },
+      { name: `${c.warning('⚡')} Connect`,                       value: 'connect' },
+      { name: `${c.primary('🚀')} Quick commands`,                value: 'commands' },
+      ...(hasDB ? [{ name: `${c.secondary('🗄')}  Database operations`, value: 'database' }] : []),
       new inquirer.Separator(),
-      { name: c.muted('← Back'),                    value: 'back' },
+      { name: `${c.primary('✏')}  Edit profile`,                  value: 'edit' },
+      { name: `${c.success('🔑')} Copy SSH key`,                  value: 'copykey' },
+      { name: `${c.primary('📡')} Test connection`,               value: 'test' },
+      { name: `${c.error('✗')}  Delete profile`,                  value: 'delete' },
+      new inquirer.Separator(),
+      { name: c.muted('← Back'),                                   value: 'back' },
     ],
   }]);
 
-  if (action === 'back')   return;
-  if (action === 'edit')   { await formEditProfile(profile); return; }
-  if (action === 'delete') { await confirmDelete(id); return; }
-  if (action === 'copykey') { await menuCopyKey(profile); return; }
+  if (action === 'back')     return;
+  if (action === 'edit')     { await formEditProfile(profile); return; }
+  if (action === 'delete')   { await confirmDelete(id); return; }
+  if (action === 'copykey')  { await menuCopyKey(profile); return; }
+  if (action === 'commands') { await menuQuickCommands(profile); return; }
+  if (action === 'database') { await menuDatabase(profile); return; }
 
   if (action === 'connect') {
     const method = await pickConnectMethod(profile);
@@ -218,14 +230,15 @@ async function formAddProfile(): Promise<void> {
   const profile: Profile = {
     ...answers,
     id: nanoid(),
+    services: [],
+    snippets: [],
     createdAt: new Date().toISOString(),
   };
 
-  if (answers.addTunnels) {
-    profile.tunnels = await askTunnels();
-  }
+  if (answers.addTunnels)   profile.tunnels  = await askTunnels();
+  if (answers.addServices)  profile.services = await askServices();
 
-  const { addTunnels: _drop, ...clean } = profile as Profile & { addTunnels?: boolean };
+  const { addTunnels: _t, addServices: _s, ...clean } = profile as Profile & { addTunnels?: boolean; addServices?: boolean };
   saveProfile(clean);
   msg(`Profile "${clean.name}" saved!`, 'success');
   await pause();
@@ -238,17 +251,16 @@ async function formEditProfile(profile: Profile): Promise<void> {
   const answers = await askProfileFields(profile);
   const updated: Profile = { ...profile, ...answers };
 
-  if (answers.addTunnels) {
-    updated.tunnels = await askTunnels(profile.tunnels);
-  }
+  if (answers.addTunnels)  updated.tunnels  = await askTunnels(profile.tunnels);
+  if (answers.addServices) updated.services = await askServices(profile.services);
 
-  const { addTunnels: _drop, ...clean } = updated as Profile & { addTunnels?: boolean };
+  const { addTunnels: _t, addServices: _s, ...clean } = updated as Profile & { addTunnels?: boolean; addServices?: boolean };
   saveProfile(clean);
   msg(`Profile "${clean.name}" updated!`, 'success');
   await pause();
 }
 
-type ProfileFormAnswers = Omit<Profile, 'id' | 'createdAt' | 'lastConnected'> & { addTunnels: boolean };
+type ProfileFormAnswers = Omit<Profile, 'id' | 'createdAt' | 'lastConnected'> & { addTunnels: boolean; addServices: boolean };
 
 async function askProfileFields(defaults: Partial<Profile>): Promise<ProfileFormAnswers> {
   return inquirer.prompt<ProfileFormAnswers>([
@@ -334,6 +346,11 @@ async function askProfileFields(defaults: Partial<Profile>): Promise<ProfileForm
     {
       type: 'confirm', name: 'addTunnels',
       message: 'Configure SSH tunnels?',
+      default: false,
+    },
+    {
+      type: 'confirm', name: 'addServices',
+      message: 'Configure services on this VM? (DB, Docker, Nginx...)',
       default: false,
     },
   ]);
@@ -551,6 +568,408 @@ async function menuCopyKey(preselect: Profile | null = null): Promise<void> {
   }
 }
 
+// ─── Services wizard ─────────────────────────────────────────────────────────
+
+async function askServices(existing: ServiceConfig[] = []): Promise<ServiceConfig[]> {
+  const services: ServiceConfig[] = [...existing];
+
+  while (true) {
+    banner();
+    if (services.length > 0) {
+      console.log(c.primary.bold('  Configured services:'));
+      services.forEach((s, i) => {
+        const details = [
+          s.dbName ? `db: ${s.dbName}` : '',
+          s.dbUser ? `user: ${s.dbUser}` : '',
+          s.dbPort ? `port: ${s.dbPort}` : '',
+          s.containerName ? `container: ${s.containerName}` : '',
+        ].filter(Boolean).join('  ');
+        console.log(c.muted(`  ${i + 1}. ${c.warning(s.type.padEnd(10))} ${c.text(s.name)}  ${c.muted(details)}`));
+      });
+      console.log();
+    }
+
+    const { action } = await inquirer.prompt<{ action: string }>([{
+      type: 'list', name: 'action',
+      message: 'Services',
+      choices: [
+        { name: '+ Add PostgreSQL',   value: 'postgres' },
+        { name: '+ Add MySQL',        value: 'mysql' },
+        { name: '+ Add Redis',        value: 'redis' },
+        { name: '+ Add Docker',       value: 'docker' },
+        { name: '+ Add Nginx',        value: 'nginx' },
+        { name: '+ Add custom',       value: 'custom' },
+        ...(services.length > 0 ? [{ name: c.error('✗ Remove a service'), value: 'remove' }] : []),
+        new inquirer.Separator(),
+        { name: c.success('✓ Done'), value: 'done' },
+      ],
+    }]);
+
+    if (action === 'done') break;
+
+    if (action === 'remove') {
+      const { idx } = await inquirer.prompt<{ idx: number }>([{
+        type: 'list', name: 'idx',
+        message: 'Which service to remove?',
+        choices: services.map((s, i) => ({ name: `${s.type} — ${s.name}`, value: i })),
+      }]);
+      services.splice(idx, 1);
+      continue;
+    }
+
+    const defaultPort = SERVICE_DEFAULT_PORTS[action as keyof typeof SERVICE_DEFAULT_PORTS] ?? 0;
+    const isDB = ['postgres', 'mysql'].includes(action);
+    const isDocker = action === 'docker';
+
+    const fields = await inquirer.prompt<{
+      name: string; dbName?: string; dbUser?: string; dbPort?: number; containerName?: string;
+    }>([
+      {
+        type: 'input', name: 'name',
+        message: `Display name (e.g. fentu_prod):`,
+        validate: (v: string) => v.trim() ? true : 'Required',
+      },
+      ...(isDB ? [
+        { type: 'input',  name: 'dbName', message: 'Database name:', default: '' },
+        { type: 'input',  name: 'dbUser', message: 'Database user:', default: '' },
+        { type: 'number', name: 'dbPort', message: 'Port:', default: defaultPort },
+      ] : []),
+      ...(isDocker ? [
+        { type: 'input', name: 'containerName', message: 'Container name (optional):', default: '' },
+      ] : []),
+      ...(!isDB && !isDocker && defaultPort > 0 ? [
+        { type: 'number', name: 'dbPort', message: 'Port:', default: defaultPort },
+      ] : []),
+    ]);
+
+    services.push({
+      id: nanoid(),
+      type: action as ServiceConfig['type'],
+      name: fields.name,
+      dbName: fields.dbName || undefined,
+      dbUser: fields.dbUser || undefined,
+      dbPort: fields.dbPort || undefined,
+      containerName: fields.containerName || undefined,
+    });
+  }
+
+  return services;
+}
+
+// ─── Quick Commands menu ──────────────────────────────────────────────────────
+
+async function menuQuickCommands(profile: Profile): Promise<void> {
+  while (true) {
+    banner();
+    console.log(c.primary.bold(`  Quick Commands — ${profile.name}\n`));
+
+    const method = await pickConnectMethod(profile);
+
+    // Build choices: global built-ins + service-specific + profile snippets + custom globals
+    const builtInChoices = GLOBAL_SNIPPETS.map(s => ({
+      name: `${c.muted('global')}  ${c.text(s.name.padEnd(25))} ${c.muted(s.description ?? '')}`,
+      value: `builtin:${s.name}`,
+    }));
+
+    const serviceChoices: { name: string; value: string }[] = [];
+    for (const svc of profile.services) {
+      const cmds = getServiceSnippets(svc);
+      for (const cmd of cmds) {
+        serviceChoices.push({
+          name: `${c.warning(svc.type.padEnd(10))} ${c.text(cmd.name)}`,
+          value: `svc:${svc.id}:${cmd.name}`,
+        });
+      }
+    }
+
+    const profileSnippetChoices = profile.snippets.map(s => ({
+      name: `${c.secondary('custom')}  ${c.text(s.name.padEnd(24))} ${c.muted(s.description ?? '')}`,
+      value: `snippet:${s.id}`,
+    }));
+
+    const { choice } = await inquirer.prompt<{ choice: string }>([{
+      type: 'list',
+      name: 'choice',
+      message: 'Select command to run:',
+      choices: [
+        ...(builtInChoices.length    ? [new inquirer.Separator('── Global ──'), ...builtInChoices]    : []),
+        ...(serviceChoices.length    ? [new inquirer.Separator('── Services ──'), ...serviceChoices]  : []),
+        ...(profileSnippetChoices.length ? [new inquirer.Separator('── Custom ──'), ...profileSnippetChoices] : []),
+        new inquirer.Separator(),
+        { name: `${c.success('+')} Add custom snippet to this profile`, value: '__add__' },
+        { name: `${c.primary('✎')} Manage profile snippets`,           value: '__manage__' },
+        { name: c.muted('← Back'),                                      value: '__back__' },
+      ],
+      pageSize: 20,
+    }]);
+
+    if (choice === '__back__') return;
+    if (choice === '__add__')    { await addSnippetToProfile(profile); continue; }
+    if (choice === '__manage__') { await manageProfileSnippets(profile); continue; }
+
+    // Resolve the command string
+    let command = '';
+    if (choice.startsWith('builtin:')) {
+      const name = choice.slice(8);
+      command = GLOBAL_SNIPPETS.find(s => s.name === name)?.command ?? '';
+    } else if (choice.startsWith('svc:')) {
+      const [, svcId, cmdName] = choice.split(':');
+      const svc = profile.services.find(s => s.id === svcId);
+      if (svc) command = getServiceSnippets(svc).find(c => c.name === cmdName)?.command ?? '';
+    } else if (choice.startsWith('snippet:')) {
+      const id = choice.slice(8);
+      command = profile.snippets.find(s => s.id === id)?.command ?? '';
+    }
+
+    if (!command) continue;
+
+    banner();
+    console.log(c.primary.bold(`  Running on: `) + c.secondary(profile.name));
+    console.log(c.muted(`  $ `) + c.text(command));
+    console.log();
+
+    const code = runCommand(profile, method, command);
+    console.log();
+    if (code !== 0) msg(`Command exited with code ${code}`, 'error');
+    await pause();
+  }
+}
+
+async function addSnippetToProfile(profile: Profile): Promise<void> {
+  const { name, command, description } = await inquirer.prompt<{
+    name: string; command: string; description: string;
+  }>([
+    { type: 'input', name: 'name',        message: 'Snippet name:',        validate: (v: string) => v.trim() ? true : 'Required' },
+    { type: 'input', name: 'command',     message: 'Command to run:',      validate: (v: string) => v.trim() ? true : 'Required' },
+    { type: 'input', name: 'description', message: 'Description (optional):', default: '' },
+  ]);
+
+  profile.snippets.push({ id: nanoid(), name, command, description: description || undefined });
+  saveProfile(profile);
+  msg(`Snippet "${name}" added!`, 'success');
+  await pause();
+}
+
+async function manageProfileSnippets(profile: Profile): Promise<void> {
+  if (profile.snippets.length === 0) {
+    msg('No custom snippets yet. Add one first.', 'info');
+    await pause();
+    return;
+  }
+
+  const { id } = await inquirer.prompt<{ id: string }>([{
+    type: 'list', name: 'id',
+    message: 'Select snippet to delete:',
+    choices: [
+      ...profile.snippets.map(s => ({ name: `${s.name}  ${c.muted(s.command.slice(0, 40))}`, value: s.id })),
+      new inquirer.Separator(),
+      { name: c.muted('← Back'), value: '__back__' },
+    ],
+  }]);
+
+  if (id === '__back__') return;
+
+  const { yes } = await inquirer.prompt<{ yes: boolean }>([{
+    type: 'confirm', name: 'yes',
+    message: c.error('Delete this snippet?'),
+    default: false,
+  }]);
+
+  if (yes) {
+    profile.snippets = profile.snippets.filter(s => s.id !== id);
+    saveProfile(profile);
+    msg('Snippet deleted.', 'success');
+    await pause();
+  }
+}
+
+// ─── Database Operations menu ─────────────────────────────────────────────────
+
+async function menuDatabase(profile: Profile): Promise<void> {
+  const dbServices = profile.services.filter(s => ['postgres', 'mysql'].includes(s.type));
+
+  if (dbServices.length === 0) {
+    msg('No database services configured. Edit this profile to add one.', 'error');
+    await pause();
+    return;
+  }
+
+  // If multiple DB services, pick one
+  let service = dbServices[0]!;
+  if (dbServices.length > 1) {
+    const { svcId } = await inquirer.prompt<{ svcId: string }>([{
+      type: 'list', name: 'svcId',
+      message: 'Which database?',
+      choices: dbServices.map(s => ({
+        name: `${c.warning(s.type)}  ${s.name}${s.dbName ? `  (${s.dbName})` : ''}`,
+        value: s.id,
+      })),
+    }]);
+    service = dbServices.find(s => s.id === svcId)!;
+  }
+
+  while (true) {
+    banner();
+    console.log(c.primary.bold(`  Database — ${profile.name}`));
+    console.log(c.muted(`  Service: ${service.type}  •  DB: ${service.dbName ?? '?'}  •  User: ${service.dbUser ?? '?'}  •  Port: ${service.dbPort ?? '?'}\n`));
+
+    const backups = listLocalBackups(profile.id);
+
+    const { action } = await inquirer.prompt<{ action: string }>([{
+      type: 'list', name: 'action',
+      message: 'Database Operations',
+      choices: [
+        { name: `${c.success('💾')} Backup now`,          value: 'backup' },
+        { name: `${c.primary('📋')} List databases`,      value: 'listdbs' },
+        { name: `${c.primary('📋')} List tables`,         value: 'listtables' },
+        { name: `${c.primary('📊')} Database size`,       value: 'size' },
+        { name: `${c.warning('📡')} Active connections`,  value: 'connections' },
+        ...(backups.length > 0 ? [
+          new inquirer.Separator(),
+          { name: `${c.secondary('🕐')} Backup history (${backups.length} backups)`, value: 'history' },
+        ] : []),
+        new inquirer.Separator(),
+        { name: c.muted('← Back'), value: 'back' },
+      ],
+    }]);
+
+    if (action === 'back') return;
+
+    const method = await pickConnectMethod(profile);
+
+    if (action === 'backup') {
+      await doBackup(profile, service, method);
+      continue;
+    }
+
+    if (action === 'history') {
+      await menuBackupHistory(profile, service);
+      continue;
+    }
+
+    // Run an info command
+    const snippets = getServiceSnippets(service);
+    const cmdMap: Record<string, string> = {
+      listdbs:     snippets.find(s => s.name.includes('List databases'))?.command    ?? '',
+      listtables:  service.type === 'postgres'
+        ? `psql -U ${service.dbUser ?? 'postgres'} ${service.dbPort ? `-p ${service.dbPort}` : ''} ${service.dbName ? `-d ${service.dbName}` : ''} -c "\\dt"`
+        : `mysql -u ${service.dbUser ?? 'root'} ${service.dbName ?? ''} -e "SHOW TABLES;"`,
+      size:        snippets.find(s => s.name.includes('size'))?.command              ?? '',
+      connections: snippets.find(s => s.name.includes('connections') || s.name.includes('Processlist'))?.command ?? '',
+    };
+
+    const command = cmdMap[action];
+    if (!command) { msg('Command not available for this service type.', 'error'); await pause(); continue; }
+
+    banner();
+    console.log(c.primary.bold(`  Running: `) + c.muted(command));
+    console.log();
+    runCommand(profile, method, command);
+    console.log();
+    await pause();
+  }
+}
+
+async function doBackup(profile: Profile, service: ServiceConfig, method: ConnectMethod): Promise<void> {
+  banner();
+  const ts      = timestamp();
+  const dbLabel = service.dbName ?? service.name;
+  const fileName = `${ts}_${dbLabel}.sql.gz`;
+  const dir      = getBackupDir(profile.id);
+  const filePath = `${dir}/${fileName}`;
+
+  console.log(c.primary.bold(`  Backing up: `) + c.secondary(`${service.type} — ${dbLabel}`));
+  console.log(c.muted(`  Saving to:  `) + c.text(filePath));
+  console.log(c.muted(`\n  Running backup (streaming directly to local)...\n`));
+
+  const result = service.type === 'postgres'
+    ? backupPostgres(profile, method, service, filePath)
+    : backupMySQL(profile, method, service, filePath);
+
+  if (result.success) {
+    saveBackupRecord({
+      id: nanoid(),
+      profileId:    profile.id,
+      profileName:  profile.name,
+      serviceId:    service.id,
+      serviceName:  service.name,
+      dbName:       dbLabel,
+      filePath,
+      fileSizeBytes: result.fileSizeBytes,
+      createdAt:    new Date().toISOString(),
+    });
+    msg(`Backup complete! Size: ${formatSize(result.fileSizeBytes)}`, 'success');
+  } else {
+    msg(`Backup failed: ${result.error}`, 'error');
+  }
+
+  await pause();
+}
+
+async function menuBackupHistory(profile: Profile, service: ServiceConfig): Promise<void> {
+  while (true) {
+    banner();
+    console.log(c.primary.bold(`  Backup History — ${profile.name} / ${service.name}\n`));
+
+    const backups = listLocalBackups(profile.id);
+
+    if (backups.length === 0) {
+      msg('No backups found.', 'info');
+      await pause();
+      return;
+    }
+
+    const { choice } = await inquirer.prompt<{ choice: string }>([{
+      type: 'list', name: 'choice',
+      message: 'Select backup:',
+      choices: [
+        ...backups.map(b => ({
+          name: [
+            c.text(b.mtime.toLocaleString().padEnd(22)),
+            c.primary(formatSize(b.fileSizeBytes).padEnd(10)),
+            c.muted(b.fileName),
+          ].join('  '),
+          value: b.filePath,
+        })),
+        new inquirer.Separator(),
+        { name: c.muted('← Back'), value: '__back__' },
+      ],
+      pageSize: 15,
+    }]);
+
+    if (choice === '__back__') return;
+
+    const { action } = await inquirer.prompt<{ action: string }>([{
+      type: 'list', name: 'action',
+      message: 'What do you want to do?',
+      choices: [
+        { name: `${c.primary('📂')} Show file path`,  value: 'path' },
+        { name: `${c.error('✗')}  Delete backup`,     value: 'delete' },
+        { name: c.muted('← Back'),                    value: 'back' },
+      ],
+    }]);
+
+    if (action === 'back') continue;
+    if (action === 'path') {
+      console.log(c.muted('\n  Path: ') + c.text(choice));
+      await pause();
+    }
+    if (action === 'delete') {
+      const { yes } = await inquirer.prompt<{ yes: boolean }>([{
+        type: 'confirm', name: 'yes',
+        message: c.error('Delete this backup file? Cannot be undone.'),
+        default: false,
+      }]);
+      if (yes) {
+        deleteLocalBackup(choice);
+        msg('Backup deleted.', 'success');
+        await pause();
+        return;
+      }
+    }
+  }
+}
+
 // ─── Import from ~/.ssh/config ───────────────────────────────────────────────
 
 async function menuImportSSHConfig(): Promise<void> {
@@ -638,7 +1057,9 @@ async function menuImportSSHConfig(): Promise<void> {
       jumpHost: undefined,
       cloudflaredHostname: undefined,
       proxyCommand: undefined,
-      tunnels: [],
+      tunnels:  [],
+      services: [],
+      snippets: [],
       group,
       tags: [],
       notes: [
