@@ -16,8 +16,19 @@ try {
   // Non-fatal: Windows or restricted env
 }
 
+/** Ensure profiles saved by older versions have all required fields. */
+function normalize(profile: Partial<Profile>): Profile {
+  return {
+    tunnels: [],
+    tags: [],
+    group: 'dev',
+    port: 22,
+    ...profile,
+  } as Profile;
+}
+
 export function getProfiles(): Profile[] {
-  return store.get('profiles');
+  return store.get('profiles').map(normalize);
 }
 
 export function getProfile(id: string): Profile | undefined {
